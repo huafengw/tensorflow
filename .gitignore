@@ -1,6 +1,8 @@
 .DS_Store
 .ipynb_checkpoints
 .idea
+.iml
+target/
 node_modules
 /bazel-*
 /third_party/py/numpy/numpy_include
