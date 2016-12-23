@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class TFServer {
   public ServerDef serverDef;
@@ -44,6 +45,12 @@ public class TFServer {
     } catch (IOException e) {
       //
     }
+  }
+
+  public TFServer(Map<String,List<String>> clusterSpec, String jobName, int taskIndex)
+    throws TFServerException {
+    this(new ClusterSpec(clusterSpec), jobName, taskIndex,
+      "grpc", ConfigProto.getDefaultInstance());
   }
 
   public void start() {
