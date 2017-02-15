@@ -77,7 +77,7 @@ Status QueueRunner::Init(const QueueRunnerDef& queue_runner_def) {
 QueueRunner::~QueueRunner() {
   // Cannot run Stop() here because the session might already be closed or
   // destroyed.
-  Join();
+  Join().IgnoreError();
 }
 
 Status QueueRunner::Start(Session* sess) { return Start(sess, 0); }
@@ -110,13 +110,13 @@ Status QueueRunner::Start(Session* sess, int wait_for) {
 }
 
 void QueueRunner::Stop(Session* sess) {
-  if (cancel_op_name_.empty()) {
-    return;
-  }
   if (coord_ != nullptr) {
     coord_->WaitForStop();
   }
-  UpdateStatus(sess->Run({}, {}, {cancel_op_name_}, nullptr));
+  if (!cancel_op_name_.empty()) {
+    UpdateStatus(sess->Run({}, {}, {cancel_op_name_}, nullptr));
+  }
+  stopped_ = true;
 }
 
 Status QueueRunner::Join() {
@@ -175,7 +175,7 @@ void QueueRunner::Run(Session* sess, const string& enqueue_op) {
   } else if (!status.ok()) {
     UpdateStatus(status);
     if (coord_) {
-      coord_->RequestStop();
+      coord_->RequestStop().IgnoreError();
     }
   }
 }

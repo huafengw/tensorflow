@@ -22,12 +22,12 @@ limitations under the License.
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/lib/strings/strcat.h"
+#include "tensorflow/core/protobuf/debug.pb.h"
 
 namespace tensorflow {
 
-DebuggerState::DebuggerState(
-    const protobuf::RepeatedPtrField<DebugTensorWatch>& watches)
-    : watches(watches), debug_urls_() {
+DebuggerState::DebuggerState(const DebugOptions& debug_options)
+    : watches(debug_options.debug_tensor_watch_opts()), debug_urls_() {
   for (const DebugTensorWatch& watch : watches) {
     for (const string& url : watch.debug_urls()) {
       debug_urls_.insert(url);
@@ -37,7 +37,7 @@ DebuggerState::DebuggerState(
 
 DebuggerState::~DebuggerState() {
   for (const string& debug_url : debug_urls_) {
-    DebugIO::CloseDebugURL(debug_url);
+    DebugIO::CloseDebugURL(debug_url).IgnoreError();
   }
 }
 
@@ -64,8 +64,25 @@ const string DebuggerState::SummarizeDebugTensorWatches() {
   return oss.str();
 }
 
-Status DebuggerState::InsertNodes(Graph* graph, Device* device) {
-  return DebugNodeInserter::InsertNodes(watches, graph, device);
+Status DebuggerState::DecorateGraphForDebug(Graph* graph, Device* device) {
+  Status status;
+
+  status.Update(DebugNodeInserter::InsertNodes(watches, graph, device));
+  if (status.ok()) {
+    status.Update(DebugIO::PublishGraph(*graph, debug_urls_));
+  }
+
+  return status;
+}
+
+Status DebuggerState::PublishDebugMetadata(
+    const int64 global_step, const int64 session_run_count,
+    const int64 executor_step_count, const std::vector<string>& input_names,
+    const std::vector<string>& output_names,
+    const std::vector<string>& target_nodes) {
+  return DebugIO::PublishDebugMetadata(global_step, session_run_count,
+                                       executor_step_count, input_names,
+                                       output_names, target_nodes, debug_urls_);
 }
 
 // static
@@ -160,8 +177,8 @@ Status DebugNodeInserter::InsertNodes(
 
       const DataType src_dt = src_node->output_type(src_output_slot);
       MemoryType memory_type;
-      MemoryTypeForOutput(device_type, graph, src_node, src_output_slot,
-                          &memory_type);
+      TF_RETURN_IF_ERROR(MemoryTypeForOutput(device_type, graph, src_node,
+                                             src_output_slot, &memory_type));
 
       // Create the copy node for the watched tensor.
       Node* copy_node;
@@ -214,10 +231,12 @@ Status DebugNodeInserter::InsertNodes(
 
         // Add control edges from the debug nodes to the destination node
         // to ensure that the debug nodes are executed before the destination
-        // node.
+        // node. Skip Enter and NextIteration ops to avoid hanging.
         for (Node* debug_node : debug_nodes) {
-          graph->AddEdge(debug_node, Graph::kControlSlot, edge->dst(),
-                         Graph::kControlSlot);
+          if (!src_node->IsEnter() && !src_node->IsNextIteration()) {
+            graph->AddEdge(debug_node, Graph::kControlSlot, edge->dst(),
+                           Graph::kControlSlot);
+          }
         }
       }
     }

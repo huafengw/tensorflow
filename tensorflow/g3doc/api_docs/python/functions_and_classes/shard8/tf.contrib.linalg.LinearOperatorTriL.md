@@ -1,6 +1,6 @@
 `LinearOperator` acting like a [batch] square lower triangular matrix.
 
-This operator acts like a [batch] matrix `A` with shape
+This operator acts like a [batch] lower triangular matrix `A` with shape
 `[B1,...,Bb, N, N]` for some `b >= 0`.  The first `b` indices index a
 batch member.  For every batch index `(i1,...,ib)`, `A[i1,...,ib, : :]` is
 an `N x N` matrix.
@@ -31,16 +31,9 @@ operator.apply(x)
 # Create a [2, 3] batch of 4 x 4 linear operators.
 tril = tf.random_normal(shape=[2, 3, 4, 4])
 operator = LinearOperatorTriL(tril)
-
-# Create a shape [2, 1, 4, 2] vector.  Note that this shape is compatible
-# since the batch dimensions, [2, 1], are brodcast to
-# operator.batch_shape = [2, 3].
-y = tf.random_normal(shape=[2, 1, 4, 2])
-x = operator.solve(y)
-==> operator.apply(x) = y
 ```
 
-### Shape compatibility
+#### Shape compatibility
 
 This operator acts on [batch] matrix with compatible shape.
 `x` is a batch matrix with compatible shape for `apply` and `solve` if
@@ -50,7 +43,7 @@ operator.shape = [B1,...,Bb] + [N, N],  with b >= 0
 x.shape =        [B1,...,Bb] + [N, R],  with R >= 0.
 ```
 
-### Performance
+#### Performance
 
 Suppose `operator` is a `LinearOperatorTriL` of shape `[N, N]`,
 and `x.shape = [N, R]`.  Then
@@ -62,10 +55,10 @@ and `x.shape = [N, R]`.  Then
 If instead `operator` and `x` have shape `[B1,...,Bb, N, N]` and
 `[B1,...,Bb, N, R]`, every operation increases in complexity by `B1*...*Bb`.
 
-### Matrix property hints
+#### Matrix property hints
 
 This `LinearOperator` is initialized with boolean flags of the form `is_X`,
-for `X = non_singular, self_adjoint` etc...
+for `X = non_singular, self_adjoint, positive_definite`.
 These have the following meaning
 * If `is_X == True`, callers should expect the operator to have the
   property `X`.  This is a promise that should be fulfilled, but is *not* a
@@ -192,7 +185,7 @@ If this operator acts like the batch matrix `A` with
 
 - - -
 
-#### `tf.contrib.linalg.LinearOperatorTriL.batch_shape_dynamic(name='batch_shape_dynamic')` {#LinearOperatorTriL.batch_shape_dynamic}
+#### `tf.contrib.linalg.LinearOperatorTriL.batch_shape_tensor(name='batch_shape_tensor')` {#LinearOperatorTriL.batch_shape_tensor}
 
 Shape of batch dimensions of this operator, determined at runtime.
 
@@ -225,6 +218,44 @@ Determinant for every batch member.
 
   `Tensor` with shape `self.batch_shape` and same `dtype` as `self`.
 
+##### Raises:
+
+
+*  <b>`NotImplementedError`</b>: If `self.is_square` is `False`.
+
+
+- - -
+
+#### `tf.contrib.linalg.LinearOperatorTriL.diag_part(name='diag_part')` {#LinearOperatorTriL.diag_part}
+
+Efficiently get the [batch] diagonal part of this operator.
+
+If this operator has shape `[B1,...,Bb, M, N]`, this returns a
+`Tensor` `diagonal`, of shape `[B1,...,Bb, min(M, N)]`, where
+`diagonal[b1,...,bb, i] = self.to_dense()[b1,...,bb, i, i]`.
+
+```
+my_operator = LinearOperatorDiag([1., 2.])
+
+# Efficiently get the diagonal
+my_operator.diag_part()
+==> [1., 2.]
+
+# Equivalent, but inefficient method
+tf.matrix_diag_part(my_operator.to_dense())
+==> [1., 2.]
+```
+
+##### Args:
+
+
+*  <b>`name`</b>: A name for this `Op`.
+
+##### Returns:
+
+
+*  <b>`diag_part`</b>: A `Tensor` of same `dtype` as self.
+
 
 - - -
 
@@ -237,13 +268,12 @@ If this operator acts like the batch matrix `A` with
 
 ##### Returns:
 
-  Python integer if vector space dimension can be determined statically,
-    otherwise `None`.
+  `Dimension` object.
 
 
 - - -
 
-#### `tf.contrib.linalg.LinearOperatorTriL.domain_dimension_dynamic(name='domain_dimension_dynamic')` {#LinearOperatorTriL.domain_dimension_dynamic}
+#### `tf.contrib.linalg.LinearOperatorTriL.domain_dimension_tensor(name='domain_dimension_tensor')` {#LinearOperatorTriL.domain_dimension_tensor}
 
 Dimension (in the sense of vector spaces) of the domain of this operator.
 
@@ -299,6 +329,13 @@ List of graph dependencies of this `LinearOperator`.
 
 - - -
 
+#### `tf.contrib.linalg.LinearOperatorTriL.is_square` {#LinearOperatorTriL.is_square}
+
+Return `True/False` depending on if this operator is square.
+
+
+- - -
+
 #### `tf.contrib.linalg.LinearOperatorTriL.log_abs_determinant(name='log_abs_det')` {#LinearOperatorTriL.log_abs_determinant}
 
 Log absolute value of determinant for every batch member.
@@ -311,6 +348,11 @@ Log absolute value of determinant for every batch member.
 ##### Returns:
 
   `Tensor` with shape `self.batch_shape` and same `dtype` as `self`.
+
+##### Raises:
+
+
+*  <b>`NotImplementedError`</b>: If `self.is_square` is `False`.
 
 
 - - -
@@ -331,13 +373,12 @@ If this operator acts like the batch matrix `A` with
 
 ##### Returns:
 
-  Python integer if vector space dimension can be determined statically,
-    otherwise `None`.
+  `Dimension` object.
 
 
 - - -
 
-#### `tf.contrib.linalg.LinearOperatorTriL.range_dimension_dynamic(name='range_dimension_dynamic')` {#LinearOperatorTriL.range_dimension_dynamic}
+#### `tf.contrib.linalg.LinearOperatorTriL.range_dimension_tensor(name='range_dimension_tensor')` {#LinearOperatorTriL.range_dimension_tensor}
 
 Dimension (in the sense of vector spaces) of the range of this operator.
 
@@ -373,7 +414,7 @@ If this operator acts like the batch matrix `A` with
 
 - - -
 
-#### `tf.contrib.linalg.LinearOperatorTriL.shape_dynamic(name='shape_dynamic')` {#LinearOperatorTriL.shape_dynamic}
+#### `tf.contrib.linalg.LinearOperatorTriL.shape_tensor(name='shape_tensor')` {#LinearOperatorTriL.shape_tensor}
 
 Shape of this `LinearOperator`, determined at runtime.
 
@@ -430,7 +471,7 @@ X[3, :, 2]  # Solution to the linear system A[3, :, :] X = RHS[3, :, 2]
 ##### Raises:
 
 
-*  <b>`ValueError`</b>: If self.is_non_singular is False.
+*  <b>`NotImplementedError`</b>: If `self.is_non_singular` or `is_square` is False.
 
 
 - - -
@@ -454,7 +495,7 @@ If this operator acts like the batch matrix `A` with
 
 - - -
 
-#### `tf.contrib.linalg.LinearOperatorTriL.tensor_rank_dynamic(name='tensor_rank_dynamic')` {#LinearOperatorTriL.tensor_rank_dynamic}
+#### `tf.contrib.linalg.LinearOperatorTriL.tensor_rank_tensor(name='tensor_rank_tensor')` {#LinearOperatorTriL.tensor_rank_tensor}
 
 Rank (in the sense of tensors) of matrix corresponding to this operator.
 

@@ -1,4 +1,4 @@
-### `tf.contrib.training.batch_sequences_with_states(input_key, input_sequences, input_context, input_length, initial_states, num_unroll, batch_size, num_threads=3, capacity=1000, allow_small_batch=True, pad=True, name=None)` {#batch_sequences_with_states}
+### `tf.contrib.training.batch_sequences_with_states(input_key, input_sequences, input_context, input_length, initial_states, num_unroll, batch_size, num_threads=3, capacity=1000, allow_small_batch=True, pad=True, make_keys_unique=False, make_keys_unique_seed=None, name=None)` {#batch_sequences_with_states}
 
 Creates batches of segments of sequential input.
 
@@ -60,10 +60,10 @@ batch = tf.batch_sequences_with_states(
 inputs = batch.sequences["input"]
 context_label = batch.context["label"]
 
-inputs_by_time = tf.split(1, num_unroll, inputs)
+inputs_by_time = tf.split(value=inputs, num_or_size_splits=num_unroll, axis=1)
 assert len(inputs_by_time) == num_unroll
 
-lstm_output, _ = tf.nn.state_saving_rnn(
+lstm_output, _ = tf.contrib.rnn.static_state_saving_rnn(
   cell,
   inputs_by_time,
   state_saver=batch,
@@ -86,7 +86,11 @@ while True:
     input example.  This is used to keep track of the split minibatch elements
     of this input.  Batched keys of the current iteration are made
     accessible via the `key` property.  The shape of `input_key` (scalar) must
-    be fully specified.
+    be fully specified.  Consider setting `make_keys_unique` to True when
+    iterating over the same input multiple times.
+
+    **Note**: if `make_keys_unique=False` then `input_key`s must be unique.
+
 *  <b>`input_sequences`</b>: A dict mapping string names to `Tensor` values.  The values
     must all have matching first dimension, called `value_length`. They may
     vary from input to input. The remainder of the shape (other than the first
@@ -141,6 +145,11 @@ while True:
     `num_unroll`. In that case `input_length` may be `None` and is assumed to
     be the length of first dimension of values in `input_sequences`
     (i.e. `value_length`).
+*  <b>`make_keys_unique`</b>: Whether to append a random integer to the `input_key` in
+    an effort to make it unique. The seed can be set via
+    `make_keys_unique_seed`.
+*  <b>`make_keys_unique_seed`</b>: If `make_keys_unique=True` this fixes the seed with
+    which a random postfix is generated.
 *  <b>`name`</b>: An op name string (optional).
 
 ##### Returns:

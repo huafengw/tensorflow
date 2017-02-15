@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef THIRD_PARTY_TENSORFLOW_CORE_KERNELS_HEXAGON_I_SOC_CONTROL_WRAPPER_H_
 #define THIRD_PARTY_TENSORFLOW_CORE_KERNELS_HEXAGON_I_SOC_CONTROL_WRAPPER_H_
 
+#include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/kernels/hexagon/graph_transferer.h"
 #include "tensorflow/core/platform/macros.h"
@@ -25,14 +26,16 @@ namespace tensorflow {
 class ISocControlWrapper {
  public:
   using ByteArray =
-      std::tuple<uint8 * /* data */, uint64 /* size */, DataType /* type */>;
+      std::tuple<uint8* /* data */, uint64 /* size */, DataType /* type */>;
+  using ConstByteArray = std::tuple<const uint8* /* data */, uint64 /* size */,
+                                    DataType /* type */>;
 
   ISocControlWrapper() = default;
   virtual ~ISocControlWrapper() = default;
 
   // Return version of SOC controller library.
   // This function is mainly for a debug purpose to verify SOC controller.
-  virtual int GetVersion() const = 0;
+  virtual int GetVersion() = 0;
 
   // Initialize SOC. This function should be called before
   // starting graph transfer.
@@ -51,12 +54,16 @@ class ISocControlWrapper {
   // Teardown Graph on SOC
   virtual bool TeardownGraph() = 0;
 
-  // Fill input node's output on SOC
-  virtual bool FillInputNode(string node_name, const ByteArray bytes) = 0;
+  // Fill input node's output on SOC with ByteArray
+  virtual bool FillInputNode(const string& node_name,
+                             const ConstByteArray bytes) = 0;
+
+  // Fill input node's output on SOC with Tensor
+  virtual bool FillInputNode(const string& node_name, const Tensor& tensor) = 0;
 
   // Read output node's outputs on SOC
   virtual bool ReadOutputNode(string node_name,
-                              std::vector<ByteArray> *outputs) const = 0;
+                              std::vector<ByteArray> *outputs) = 0;
 
  private:
   TF_DISALLOW_COPY_AND_ASSIGN(ISocControlWrapper);

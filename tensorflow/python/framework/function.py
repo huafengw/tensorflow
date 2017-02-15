@@ -25,8 +25,6 @@ import hashlib
 import inspect
 import re
 
-from six.moves import xrange  # pylint: disable=redefined-builtin
-
 from tensorflow.core.framework import attr_value_pb2
 from tensorflow.core.framework import function_pb2
 from tensorflow.core.framework import op_def_pb2
@@ -42,10 +40,21 @@ def _make_argname_from_tensor_name(name):
   return re.sub(":0$", "", name).replace(":", "_o")
 
 
-def _tensor_to_argdef(t, name=None):
+def _tensor_to_argdef(t, name=None, used_names=None):
+  """Convert tensor t to an argdef, with a specified name or a unique name."""
   arg = op_def_pb2.OpDef.ArgDef()
   if name is None:
     arg.name = _make_argname_from_tensor_name(t.name)
+    if used_names is not None:
+      if arg.name in used_names:
+        i = 0
+        while True:
+          new_name = "%s_U%d" % (arg.name, i)
+          if new_name not in used_names:
+            arg.name = new_name
+            break
+          i += 1
+      used_names.add(arg.name)
   else:
     arg.name = name
   arg.type = t.dtype.as_datatype_enum
@@ -54,73 +63,6 @@ def _tensor_to_argdef(t, name=None):
 
 def _get_node_def(op):
   return op._node_def  # pylint: disable=protected-access
-
-
-def _add_input_array(op, start, limit, dtype, func):
-  """Adds a _ListToArray node in the func for op.inputs[start:limit]."""
-  node = function_pb2.FunctionDef.Node()
-  node.op = "_ListToArray"
-  ret_name = op.name + "_L2A_" + str(start)
-  node.ret.extend([ret_name])
-  node.arg.extend(
-      [_make_argname_from_tensor_name(x.name) for x in op.inputs[start:limit]])
-  num = limit - start
-  node.attr["Tin"].CopyFrom(
-      attr_value_pb2.AttrValue(list=attr_value_pb2.AttrValue.ListValue(
-          type=[dtype] * num)))
-  node.attr["T"].CopyFrom(attr_value_pb2.AttrValue(type=dtype))
-  node.attr["N"].CopyFrom(attr_value_pb2.AttrValue(i=num))
-  func.node.extend([node])
-  return ret_name
-
-
-def _add_output_array(op, start, limit, dtype, func):
-  """Adds a _ArrayToList node in the func for op.outputs[start:limit]."""
-  dtype_proto = attr_value_pb2.AttrValue(type=dtype)
-  # A node converting N*T to list(T)
-  node = function_pb2.FunctionDef.Node()
-  node.op = "_ArrayToList"
-  arg_name = op.name + "_A2L_" + str(start)
-  ret_name = arg_name + "_out"
-  node.ret.append(ret_name)
-  node.arg.append(arg_name)
-  node.attr["T"].CopyFrom(dtype_proto)
-  num = limit - start
-  node.attr["N"].CopyFrom(attr_value_pb2.AttrValue(i=num))
-  node.attr["out_types"].CopyFrom(
-      attr_value_pb2.AttrValue(list=attr_value_pb2.AttrValue.ListValue(
-          type=[dtype] * num)))
-  func.node.extend([node])
-  num = limit - start
-  # Adds an identity node for each element in the array N*T so that
-  # uses of each element can be added easily later. These Identity
-  # will be eliminated before graph execution.
-  for i in xrange(num):
-    node = function_pb2.FunctionDef.Node()
-    node.op = "Identity"
-    node.arg.append(ret_name + ":" + str(i))
-    node.ret.append(_make_argname_from_tensor_name(op.outputs[i].name))
-    node.attr["T"].CopyFrom(dtype_proto)
-    func.node.extend([node])
-  return arg_name
-
-
-def _add_output_list(op, start, limit, dtype_lst, func):
-  """Adds a _ArrayToList node in the func for op.outputs[start:limit]."""
-  ret_name = op.name + "_Lst_" + str(start) + "_" + str(limit)
-  num = limit - start
-  assert len(dtype_lst) == num
-  # Adds an identity node for each element in the array N*T so that
-  # uses of each element can be added easily later. These Identity
-  # will be eliminated before graph execution.
-  for i in xrange(num):
-    node = function_pb2.FunctionDef.Node()
-    node.op = "Identity"
-    node.arg.append(ret_name + ":" + str(i))
-    node.ret.append(_make_argname_from_tensor_name(op.outputs[i].name))
-    node.attr["T"].CopyFrom(attr_value_pb2.AttrValue(type=dtype_lst[i]))
-    func.node.extend([node])
-  return ret_name
 
 
 def _get_op_def(op):
@@ -177,76 +119,6 @@ def _add_op_node(op, func, input_dict):
           "%s missing from %s" % (node_def.input[i], input_dict.items()))
       node_def.input[i] = input_dict[node_def.input[i]]
 
-  # To support legacy consumers, add an entry in func.node.
-  # TODO(josh11b): Delete this.
-  node = function_pb2.FunctionDef.Node()
-  node.op = op.type
-  op_def = _get_op_def(op)
-  attrs = node_def.attr
-  if not op_def.output_arg:
-    node.ret.append(_make_argname_from_tensor_name(op.name))
-  else:
-    out_index = 0
-    for arg_def in op_def.output_arg:
-      if arg_def.number_attr:
-        dtype = arg_def.type or attrs[arg_def.type_attr].type
-        num = attrs[arg_def.number_attr].i
-        node.ret.append(
-            _add_output_array(op, out_index, out_index + num, dtype, func))
-        out_index += num
-      elif arg_def.type_list_attr:
-        dtype_lst = attrs[arg_def.type_list_attr].list.type
-        num = len(dtype_lst)
-        node.ret.append(
-            _add_output_list(op, out_index, out_index + num, dtype_lst, func))
-        out_index += num
-      else:
-        node.ret.append(
-            _make_argname_from_tensor_name(op.outputs[out_index].name))
-        out_index += 1
-  inp_index = 0
-  for arg_def in op_def.input_arg:
-    if arg_def.number_attr:
-      dtype = arg_def.type or attrs[arg_def.type_attr].type
-      num = attrs[arg_def.number_attr].i
-      node.arg.append(
-          _add_input_array(op, inp_index, inp_index + num, dtype, func))
-      inp_index += num
-    elif arg_def.type_list_attr:
-      num = len(attrs[arg_def.type_list_attr].list.type)
-      node.arg.extend([
-          _make_argname_from_tensor_name(op.inputs[i].name)
-          for i in range(inp_index, inp_index + num)
-      ])
-      inp_index += num
-    else:
-      node.arg.append(_make_argname_from_tensor_name(op.inputs[inp_index].name))
-      inp_index += 1
-  node.dep.extend(
-      [_make_argname_from_tensor_name(x.name) for x in op.control_inputs])
-  for k, v in attrs.items():
-    node.attr[k].CopyFrom(v)
-  func.node.extend([node])
-
-
-def _replace_ret(func, original, replacement):
-  for n in func.node:
-    for i, r in enumerate(n.ret):
-      if r == original:
-        n.ret[i] = replacement
-        return
-  raise ValueError("Could not find ret == '%s'" % original)
-
-
-def _replace_arg(func, original, replacement):
-  for n in func.node:
-    for i, a in enumerate(n.arg):
-      if a == original:
-        n.arg[i] = replacement
-    for i, d in enumerate(n.dep):
-      if d == original:
-        n.dep[i] = replacement
-
 
 def _graph_to_function_def(graph, inputs, outputs, out_names=None):
   """Returns `graph` as a `FunctionDef` protocol buffer.
@@ -274,16 +146,23 @@ def _graph_to_function_def(graph, inputs, outputs, out_names=None):
   """
   func = function_pb2.FunctionDef()
   func.signature.name = "_"
-  func.signature.input_arg.extend([_tensor_to_argdef(i) for i in inputs])
+  used_names = set()
+  func.signature.input_arg.extend([_tensor_to_argdef(i, used_names=used_names)
+                                   for i in inputs])
   if out_names is None:
-    func.signature.output_arg.extend([_tensor_to_argdef(o) for o in outputs])
+    used_names = set()
+    func.signature.output_arg.extend([
+        _tensor_to_argdef(o, used_names=used_names) for o in outputs])
   elif len(outputs) != len(out_names):
     raise ValueError(
         "Length of out_names (%d) does not match number of outputs (%d): %s" %
         (len(out_names), len(outputs), ", ".join(out_names)))
+  elif len(out_names) != len(set(out_names)):
+    raise ValueError(
+        "Must not have duplicates in out_names: %s" % ", ".join(out_names))
   else:
     func.signature.output_arg.extend([
-        _tensor_to_argdef(o, n) for o, n in zip(outputs, out_names)])
+        _tensor_to_argdef(o, name=n) for o, n in zip(outputs, out_names)])
   func_arg_placeholders = set([i.name for i in inputs])
   input_dict = _create_input_dict(graph, func_arg_placeholders)
 
@@ -293,27 +172,30 @@ def _graph_to_function_def(graph, inputs, outputs, out_names=None):
     _add_op_node(op, func, input_dict)
 
   if out_names is None:
-    for o in outputs:
-      k = _make_argname_from_tensor_name(o.name)
+    for index, o in enumerate(outputs):
+      k = func.signature.output_arg[index].name
       func.ret[k] = input_dict[o.name]
   else:
     for o, n in zip(outputs, out_names):
       func.ret[n] = input_dict[o.name]
-      # TODO(josh11b): Delete this once we switch fully to NodeDefs for
-      # function bodies.
-      k = _make_argname_from_tensor_name(o.name)
-      _replace_ret(func, k, n)
-      _replace_arg(func, k, n)
 
   return func
 
 
-def _parse_kwargs_as_attrs(**kwargs):
+def _parse_kwargs_as_attrs(func_name, **kwargs):
   """Parses **kwargs into a node's attributes."""
   attrs = {}
+
   noinline = kwargs.pop("noinline", None)
   if noinline is not None:
     attrs["_noinline"] = attr_value_pb2.AttrValue(b=bool(noinline))
+
+  compiled = kwargs.pop("compiled", None)
+  if compiled is not None:
+    attrs["_XlaCompile"] = attr_value_pb2.AttrValue(b=bool(compiled))
+    attrs["_XlaScope"] = attr_value_pb2.AttrValue(
+        s=("function_%s" % func_name).encode())
+
   if kwargs:
     raise ValueError("Unknown keyword arguments: %s" % kwargs.keys())
   return attrs
@@ -342,9 +224,9 @@ def _call(sig, *inputs, **kwargs):
         'noinline'.
 
   Returns:
-     A Tensor if the function returns a single value; a list of Tensors
-     if the functio returns multiple value; the Operation if the function
-     returns no values.
+     A 2-element tuple. First element: a Tensor if the function returns a single
+     value; a list of Tensors if the function returns multiple value; the
+     Operation if the function returns no values. Second element: the Operation.
 
   Raises:
     ValueError: if the arguments are invalid.
@@ -353,9 +235,9 @@ def _call(sig, *inputs, **kwargs):
     raise ValueError("Expected number of arguments: %d, received: %d" %
                      (len(sig.input_arg), len(inputs)))
   name = kwargs.pop("name", None)
-  attrs = _parse_kwargs_as_attrs(**kwargs)
   g = ops.get_default_graph()
   func_name = sig.name
+  attrs = _parse_kwargs_as_attrs(func_name, **kwargs)
   output_types = [dtypes.DType(x.type) for x in sig.output_arg]
   with ops.name_scope(name, func_name, inputs) as name:
     op = g.create_op(
@@ -368,11 +250,12 @@ def _call(sig, *inputs, **kwargs):
   setattr(op, "_sig", sig)  # Remember the signature.
   if op.outputs:
     if len(op.outputs) == 1:
-      return op.outputs[0]
+      ret = op.outputs[0]
     else:
-      return tuple(op.outputs)
+      ret = tuple(op.outputs)
   else:
-    return op
+    ret = op
+  return ret, op
 
 
 def _get_func_name(func):
@@ -418,6 +301,7 @@ class _FuncGraph(ops.Graph):
              initializer=None,
              trainable=True,
              collections=None,
+             use_resource=None,
              **kwargs):
     """A custom variable getter."""
     # Here, we switch the default graph to the outer graph and ask the
@@ -436,7 +320,8 @@ class _FuncGraph(ops.Graph):
           dtype=dtype,
           initializer=initializer,
           trainable=trainable,
-          collections=collections)
+          collections=collections,
+          use_resource=use_resource)
       self.extra_vars.append(var)
       return var
 
@@ -524,6 +409,7 @@ class _DefinedFunction(object):
                grad_func=None,
                python_grad_func=None,
                out_names=None,
+               shape_func=None,
                **kwargs):
     """Creates _DefinedFunction.
 
@@ -540,6 +426,8 @@ class _DefinedFunction(object):
         the function python-side.
       out_names: An optional list of strings for the function return value
         names.
+      shape_func: An optional function mapping an op to a list of static
+        output shapes.
       **kwargs: The keyword arguments. **kwargs is passed to every call
         site of this function.
 
@@ -553,6 +441,7 @@ class _DefinedFunction(object):
     self._grad_func = grad_func
     self._python_grad_func = python_grad_func
     self._out_names = out_names
+    self._shape_func = shape_func
     self._extra_kwargs = kwargs
     self._definition = None  # Constructed lazily.
 
@@ -599,6 +488,7 @@ class _DefinedFunction(object):
   @property
   def captured_inputs(self):
     """Returns the list of implicitly captured inputs."""
+    self._create_definition_if_needed()
     return self._extra_inputs
 
   def _create_definition_if_needed(self):
@@ -633,7 +523,9 @@ class _DefinedFunction(object):
         temp_graph, inputs, outputs, out_names=self._out_names)
 
     # Extra kwargs are treated as attrs on the function def.
-    kwargs_attr = _parse_kwargs_as_attrs(**self._extra_kwargs)
+    sig_pre_func_name = self._func_name or _get_func_name(self._func)
+    kwargs_attr = _parse_kwargs_as_attrs(
+        sig_pre_func_name, **self._extra_kwargs)
     for k in kwargs_attr:
       self._definition.attr[k].CopyFrom(kwargs_attr[k])
 
@@ -654,6 +546,12 @@ class _DefinedFunction(object):
         update_num(len(slist))
         for s in slist:
           update_str(s)
+
+      for adef in self._definition.signature.input_arg:
+        update_str(adef.SerializeToString())
+
+      for adef in self._definition.signature.output_arg:
+        update_str(adef.SerializeToString())
 
       for n in sorted(self._definition.node_def, key=lambda n: n.name):
         update_str(n.name)
@@ -713,7 +611,16 @@ class _DefinedFunction(object):
   def __call__(self, *args, **kwargs):
     self.add_to_graph(ops.get_default_graph())
     args = [ops.convert_to_tensor(_) for _ in args] + self._extra_inputs
-    return _call(self._definition.signature, *args, **kwargs)
+    ret, op = _call(self._definition.signature, *args, **kwargs)
+    if self._shape_func is not None:
+      shapes = self._shape_func(op)
+      if len(shapes) != len(op.outputs):
+        raise ValueError("shape_func produced %d shapes for %d outputs" %
+                         (len(shapes), len(op.outputs)))
+      for (t, shape) in zip(op.outputs, shapes):
+        t.set_shape(shape)
+    return ret
+
 
 # NOTE: The list needs to be extended when more data types are added.
 _DTYPE_TO_STR = {
@@ -862,6 +769,10 @@ class Defun(object):
   default graph and adds the definition of the function into the
   default graph. Because the addition of the function into the graph
   is deferred, the decorator can be used anywhere in the program.
+  
+  Definitions of functions are frozen in a graph as soon as the graph is used to
+  create a session. Therefore, nodes using the function must be created in the
+  graph before the corresponding session is created.
 
   Example, but also see the [How To on functions](link_needed).
 
@@ -876,9 +787,6 @@ class Defun(object):
   b = tf.Constant([2.0])
   c, d = MyFunc(a, b, name='mycall')
   ```
-
-  @@__init__
-
   """
 
   def __init__(self, *input_types, **kwargs):
@@ -907,6 +815,9 @@ class Defun(object):
 
          out_names = (optional). A list of strings, one per output
            tensor.
+
+         shape_func - (optional). A function taking the op and returning a list
+           of static shapes to set for the function's outputs.
     """
     self._input_types = input_types
     self._func_name = kwargs.pop("func_name", None)
@@ -1000,6 +911,9 @@ class Declare(object):
     self._sig.name = func_name
 
     def _to_argdef_list(args):
+      names = [n for n, t in args]
+      if len(names) != len(set(names)):
+        raise ValueError("Expected names to all be unique: %s" % str(names))
       return [op_def_pb2.OpDef.ArgDef(type=t.as_datatype_enum, name=n)
               for n, t in args]
 
@@ -1008,4 +922,4 @@ class Declare(object):
 
   def __call__(self, *inputs, **kwargs):
     inputs = [ops.convert_to_tensor(_) for _ in inputs]
-    return _call(self._sig, *inputs, **kwargs)
+    return _call(self._sig, *inputs, **kwargs)[0]

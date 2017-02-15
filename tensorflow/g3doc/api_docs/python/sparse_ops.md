@@ -7,12 +7,7 @@ Note: Functions taking `Tensor` arguments can also take anything accepted by
 
 [TOC]
 
-## Sparse Tensor Representation
-
-TensorFlow supports a `SparseTensor` representation for data that is sparse
-in multiple dimensions. Contrast this representation with `IndexedSlices`,
-which is efficient for representing tensors that are sparse in their first
-dimension, and dense along all other dimensions.
+Sparse Tensor Representation. See the @{python/sparse_ops} guide.
 
 - - -
 
@@ -43,14 +38,11 @@ of values and number of dimensions in the `SparseTensor`, respectively:
   [2,4] of the tensor has a value of 3.6.
 
 * `dense_shape`: A 1-D int64 tensor of dense_shape `[ndims]`, which specifies
-the
-  dense_shape of the sparse tensor. Takes a list indicating the number of
-  elements
-  in each dimension. For example, `dense_shape=[3,6]` specifies a
-  two-dimensional
-  3x6 tensor, `dense_shape=[2,3,4]` specifies a three-dimensional 2x3x4
-  tensor, and
-  `dense_shape=[9]` specifies a one-dimensional tensor with 9 elements.
+  the dense_shape of the sparse tensor. Takes a list indicating the number of
+  elements in each dimension. For example, `dense_shape=[3,6]` specifies a
+  two-dimensional 3x6 tensor, `dense_shape=[2,3,4]` specifies a
+  three-dimensional 2x3x4 tensor, and `dense_shape=[9]` specifies a
+  one-dimensional tensor with 9 elements.
 
 The corresponding dense tensor satisfies:
 
@@ -78,96 +70,6 @@ represents the dense tensor
  [0, 0, 2, 0]
  [0, 0, 0, 0]]
 ```
-
-- - -
-
-#### `tf.SparseTensor.__init__(indices, values, dense_shape=None, shape=None)` {#SparseTensor.__init__}
-
-Creates a `SparseTensor`.
-
-##### Args:
-
-
-*  <b>`indices`</b>: A 2-D int64 tensor of dense_shape `[N, ndims]`.
-*  <b>`values`</b>: A 1-D tensor of any type and dense_shape `[N]`.
-*  <b>`dense_shape`</b>: A 1-D int64 tensor of dense_shape `[ndims]`.
-*  <b>`shape`</b>: Temporary.  Legacy naming of dense_shape.  Only one of `shape` or
-    `dense_shape` must be provided.
-
-##### Returns:
-
-  A `SparseTensor`.
-
-##### Raises:
-
-
-*  <b>`ValueError`</b>: if both `shape` and `dense_shape` are provided.
-
-
-- - -
-
-#### `tf.SparseTensor.get_shape()` {#SparseTensor.get_shape}
-
-Get the `TensorShape` representing the shape of the dense tensor.
-
-##### Returns:
-
-  A `TensorShape` object.
-
-
-- - -
-
-#### `tf.SparseTensor.indices` {#SparseTensor.indices}
-
-The indices of non-zero values in the represented dense tensor.
-
-##### Returns:
-
-  A 2-D Tensor of int64 with dense_shape `[N, ndims]`, where `N` is the
-    number of non-zero values in the tensor, and `ndims` is the rank.
-
-
-- - -
-
-#### `tf.SparseTensor.values` {#SparseTensor.values}
-
-The non-zero values in the represented dense tensor.
-
-##### Returns:
-
-  A 1-D Tensor of any data type.
-
-
-- - -
-
-#### `tf.SparseTensor.dense_shape` {#SparseTensor.dense_shape}
-
-A 1-D Tensor of int64 representing the shape of the dense tensor.
-
-
-- - -
-
-#### `tf.SparseTensor.dtype` {#SparseTensor.dtype}
-
-The `DType` of elements in this tensor.
-
-
-- - -
-
-#### `tf.SparseTensor.op` {#SparseTensor.op}
-
-The `Operation` that produces `values` as an output.
-
-
-- - -
-
-#### `tf.SparseTensor.graph` {#SparseTensor.graph}
-
-The `Graph` that contains the index, value, and dense_shape tensors.
-
-
-
-#### Other Methods
 - - -
 
 #### `tf.SparseTensor.__div__(sp_x, y)` {#SparseTensor.__div__}
@@ -195,6 +97,24 @@ the other direction.
 
   A `Tensor`. Has the same type as `sp_values`.
   1-D.  The `N` values that are operated on.
+
+
+- - -
+
+#### `tf.SparseTensor.__init__(indices, values, dense_shape)` {#SparseTensor.__init__}
+
+Creates a `SparseTensor`.
+
+##### Args:
+
+
+*  <b>`indices`</b>: A 2-D int64 tensor of shape `[N, ndims]`.
+*  <b>`values`</b>: A 1-D tensor of any type and shape `[N]`.
+*  <b>`dense_shape`</b>: A 1-D int64 tensor of shape `[ndims]`.
+
+##### Returns:
+
+  A `SparseTensor`.
 
 
 - - -
@@ -246,6 +166,20 @@ Internal helper function for 'sp_t / dense_t'.
 
 - - -
 
+#### `tf.SparseTensor.dense_shape` {#SparseTensor.dense_shape}
+
+A 1-D Tensor of int64 representing the shape of the dense tensor.
+
+
+- - -
+
+#### `tf.SparseTensor.dtype` {#SparseTensor.dtype}
+
+The `DType` of elements in this tensor.
+
+
+- - -
+
 #### `tf.SparseTensor.eval(feed_dict=None, session=None)` {#SparseTensor.eval}
 
 Evaluates this sparse tensor in a `Session`.
@@ -281,9 +215,50 @@ available, or `session` must be specified explicitly.
 
 - - -
 
-#### `tf.SparseTensor.shape` {#SparseTensor.shape}
+#### `tf.SparseTensor.get_shape()` {#SparseTensor.get_shape}
 
-Legacy property returning `dense_shape`.
+Get the `TensorShape` representing the shape of the dense tensor.
+
+##### Returns:
+
+  A `TensorShape` object.
+
+
+- - -
+
+#### `tf.SparseTensor.graph` {#SparseTensor.graph}
+
+The `Graph` that contains the index, value, and dense_shape tensors.
+
+
+- - -
+
+#### `tf.SparseTensor.indices` {#SparseTensor.indices}
+
+The indices of non-zero values in the represented dense tensor.
+
+##### Returns:
+
+  A 2-D Tensor of int64 with dense_shape `[N, ndims]`, where `N` is the
+    number of non-zero values in the tensor, and `ndims` is the rank.
+
+
+- - -
+
+#### `tf.SparseTensor.op` {#SparseTensor.op}
+
+The `Operation` that produces `values` as an output.
+
+
+- - -
+
+#### `tf.SparseTensor.values` {#SparseTensor.values}
+
+The non-zero values in the represented dense tensor.
+
+##### Returns:
+
+  A 1-D Tensor of any data type.
 
 
 
@@ -291,68 +266,56 @@ Legacy property returning `dense_shape`.
 
 ### `class tf.SparseTensorValue` {#SparseTensorValue}
 
-Stores the calculated numpy arrays representing a `SparseTensor`.
-
-Returned as the output of a session.run on a `SparseTensor` object.
+SparseTensorValue(indices, values, dense_shape)
 - - -
 
-#### `tf.SparseTensorValue.__getitem__(i)` {#SparseTensorValue.__getitem__}
+#### `tf.SparseTensorValue.__getnewargs__()` {#SparseTensorValue.__getnewargs__}
 
-
-
-
-- - -
-
-#### `tf.SparseTensorValue.__init__(indices, values, dense_shape=None, shape=None)` {#SparseTensorValue.__init__}
-
-
+Return self as a plain tuple.  Used by copy and pickle.
 
 
 - - -
 
-#### `tf.SparseTensorValue.__iter__()` {#SparseTensorValue.__iter__}
+#### `tf.SparseTensorValue.__getstate__()` {#SparseTensorValue.__getstate__}
+
+Exclude the OrderedDict from pickling
 
 
+- - -
+
+#### `tf.SparseTensorValue.__new__(_cls, indices, values, dense_shape)` {#SparseTensorValue.__new__}
+
+Create new instance of SparseTensorValue(indices, values, dense_shape)
 
 
 - - -
 
 #### `tf.SparseTensorValue.__repr__()` {#SparseTensorValue.__repr__}
 
-
+Return a nicely formatted representation string
 
 
 - - -
 
 #### `tf.SparseTensorValue.dense_shape` {#SparseTensorValue.dense_shape}
 
-
+Alias for field number 2
 
 
 - - -
 
 #### `tf.SparseTensorValue.indices` {#SparseTensorValue.indices}
 
-
-
-
-- - -
-
-#### `tf.SparseTensorValue.shape` {#SparseTensorValue.shape}
-
-
+Alias for field number 0
 
 
 - - -
 
 #### `tf.SparseTensorValue.values` {#SparseTensorValue.values}
 
+Alias for field number 1
 
 
-
-
-
-## Conversion
 
 - - -
 
@@ -564,14 +527,26 @@ equal to:
                dense_shape=[3, 6])
 ```
 
+This method generalizes to higher-dimensions by simply providing a list for
+both the sp_ids as well as the vocab_size.
+In this case the resulting `SparseTensor` has the following properties:
+  - `indices` is equivalent to `sp_ids[0].indices` with the last
+    dimension discarded and concatenated with
+    `sp_ids[0].values, sp_ids[1].values, ...`.
+  - `values` is simply `sp_values.values`.
+  - If `sp_ids.dense_shape = [D0, D1, ..., Dn, K]`, then
+    `output.shape = [D0, D1, ..., Dn] + vocab_size`.
+
 ##### Args:
 
 
-*  <b>`sp_ids`</b>: A `SparseTensor` with `values` property of type `int32`
-    or `int64`.
+*  <b>`sp_ids`</b>: A single `SparseTensor` with `values` property of type `int32`
+    or `int64` or a Python list of such `SparseTensor`s or a list thereof.
 *  <b>`sp_values`</b>: A`SparseTensor` of any type.
 *  <b>`vocab_size`</b>: A scalar `int64` Tensor (or Python int) containing the new size
     of the last dimension, `all(0 <= sp_ids.values < vocab_size)`.
+    Or a list thereof with `all(0 <= sp_ids[i].values < vocab_size[i])` for
+    all `i`.
 *  <b>`name`</b>: A name prefix for the returned tensors (optional)
 *  <b>`already_sorted`</b>: A boolean to specify whether the per-batch values in
    `sp_values` are already sorted. If so skip sorting, False by default
@@ -585,11 +560,12 @@ equal to:
 ##### Raises:
 
 
-*  <b>`TypeError`</b>: If `sp_ids` or `sp_values` are not a `SparseTensor`.
+*  <b>`TypeError`</b>: If `sp_values` is not a `SparseTensor`. Or if `sp_ids` is neither
+    a `SparseTensor` nor a list thereof. Or if `vocab_size` is not a
+    `Tensor` or a Python int and `sp_ids` is a `SparseTensor`. Or if
+    `vocab_size` is not a or list thereof and `sp_ids` is a list.
+*  <b>`ValueError`</b>: If `sp_ids` and `vocab_size` are lists of different lengths.
 
-
-
-## Manipulation
 
 - - -
 
@@ -1039,8 +1015,6 @@ then the output will be a `SparseTensor` of shape `[5, 4]` and
 *  <b>`TypeError`</b>: If `sp_input` is not a `SparseTensor`.
 
 
-
-## Reduction
 - - -
 
 ### `tf.sparse_reduce_sum(sp_input, axis=None, keep_dims=False, reduction_axes=None)` {#sparse_reduce_sum}
@@ -1120,8 +1094,6 @@ which are interpreted according to the indexing rules in Python.
   The reduced SparseTensor.
 
 
-
-## Math Operations
 - - -
 
 ### `tf.sparse_add(a, b, thresh=0)` {#sparse_add}
@@ -1278,9 +1250,10 @@ CPU: Intel Ivybridge with HyperThreading (6 cores) dL1:32KB dL2:256KB dL3:12MB
 GPU: NVidia Tesla k40c
 
 Compiled with:
--c opt --config=cuda --copt=-mavx
+`-c opt --config=cuda --copt=-mavx`
 
-```tensorflow/python/sparse_tensor_dense_matmul_op_test --benchmarks
+```
+tensorflow/python/sparse_tensor_dense_matmul_op_test --benchmarks
 A sparse [m, k] with % nonzero values between 1% and 80%
 B dense [k, n]
 

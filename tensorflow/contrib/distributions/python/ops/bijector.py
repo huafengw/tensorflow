@@ -12,23 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-r"""Bijector Ops.
+r"""Bijector Ops. See the @{$python/contrib.distributions.bijector} guide.
 
-An API for invertible, differentiable transformations of random variables.
-
-## Background
-
-Differentiable, bijective transformations of continuous random variables alter
-the calculations made in the cumulative/probability distribution functions and
-sample function.  This module provides a standard interface for making these
-manipulations.
-
-For more details and examples, see the `Bijector` docstring.
-
-To apply a `Bijector`, use `distributions.TransformedDistribution`.
-
-## Bijectors
-
+@@Affine
+@@AffineLinearOperator
 @@Bijector
 @@Chain
 @@CholeskyOuterProduct
@@ -36,12 +23,12 @@ To apply a `Bijector`, use `distributions.TransformedDistribution`.
 @@Identity
 @@Inline
 @@Invert
-@@ScaleAndShift
+@@PowerTransform
 @@SigmoidCentered
 @@SoftmaxCentered
 @@Softplus
-
 """
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -49,12 +36,21 @@ from __future__ import print_function
 import abc
 import collections
 import contextlib
+import itertools
 import math
 import re
+
 import numpy as np
 import six
 
+from tensorflow.contrib import framework as contrib_framework
+from tensorflow.contrib.distributions.python.ops import distribution_util
+from tensorflow.contrib.distributions.python.ops import operator_pd_cholesky
+from tensorflow.contrib.distributions.python.ops import operator_pd_diag
+from tensorflow.contrib.distributions.python.ops import operator_pd_identity
+from tensorflow.contrib.distributions.python.ops import operator_pd_vdvt_update
 from tensorflow.contrib.distributions.python.ops.shape import _DistributionShape
+from tensorflow.contrib.linalg.python.ops import linear_operator
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
@@ -67,7 +63,10 @@ from tensorflow.python.ops import linalg_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn_ops
 
+
 __all__ = [
+    "Affine",
+    "AffineLinearOperator",
     "Bijector",
     "Chain",
     "CholeskyOuterProduct",
@@ -76,63 +75,54 @@ __all__ = [
     "Inline",
     "Invert",
     "PowerTransform",
-    "ScaleAndShift",
     "SigmoidCentered",
     "SoftmaxCentered",
     "Softplus",
 ]
 
 
-# TODO(jvdillon): deprecate this function once tf.expm1 exists.
-def _expm1(x):
-  """Approximate exp{y}-1~=y  for small |y|, and exp{y}-1 elsewhere."""
-  # Recall, eps is smallest positive number such that 1 + eps != 1.
-  eps = np.finfo(x.dtype.base_dtype.as_numpy_dtype).eps
-  # Note we are careful to never send an NaN through ANY branch of where.
-  return array_ops.where(math_ops.less(math_ops.abs(x), eps),
-                         x, math_ops.exp(x) - 1.)
+def _as_tensor(x, name):
+  """Convenience to convert to `Tensor` or leave as `None`."""
+  return None if x is None else ops.convert_to_tensor(x, name=name)
 
 
-class _Mapping(collections.namedtuple("_Mapping",
-                                      ["x", "y", "ildj", "condition_kwargs"])):
+class _Mapping(collections.namedtuple(
+    "_Mapping", ["x", "y", "ildj", "kwargs"])):
   """Helper class to make it easier to manage caching in `Bijector`."""
 
-  def __new__(cls, x=None, y=None, ildj=None, condition_kwargs=None):
+  def __new__(cls, x=None, y=None, ildj=None, kwargs=None):
     """Custom __new__ so namedtuple items have defaults.
 
     Args:
       x: `Tensor`. Forward.
       y: `Tensor`. Inverse.
       ildj: `Tensor`. Inverse log det Jacobian.
-      condition_kwargs: Python dictionary. Extra args supplied to
+      kwargs: Python dictionary. Extra args supplied to
         forward/inverse/etc functions.
 
     Returns:
       mapping: New instance of _Mapping.
     """
-    return super(_Mapping, cls).__new__(cls, x, y, ildj, condition_kwargs)
+    return super(_Mapping, cls).__new__(cls, x, y, ildj, kwargs)
 
   @property
   def x_key(self):
     """Returns key used for caching Y=g(X)."""
-    return (self.x,) + self._deep_tuple(tuple(sorted(
-        self.condition_kwargs.items())))
+    return (self.x,) + self._deep_tuple(tuple(sorted(self.kwargs.items())))
 
   @property
   def y_key(self):
     """Returns key used for caching X=g^{-1}(Y)."""
-    return (self.y,) + self._deep_tuple(tuple(sorted(
-        self.condition_kwargs.items())))
+    return (self.y,) + self._deep_tuple(tuple(sorted(self.kwargs.items())))
 
-  def merge(self, x=None, y=None, ildj=None,
-            condition_kwargs=None, mapping=None):
+  def merge(self, x=None, y=None, ildj=None, kwargs=None, mapping=None):
     """Returns new _Mapping with args merged with self.
 
     Args:
       x: `Tensor`. Forward.
       y: `Tensor`. Inverse.
       ildj: `Tensor`. Inverse log det Jacobian.
-      condition_kwargs: Python dictionary. Extra args supplied to
+      kwargs: Python dictionary. Extra args supplied to
         forward/inverse/etc functions.
       mapping: Instance of _Mapping to merge. Can only be specified if no other
         arg is specified.
@@ -144,16 +134,14 @@ class _Mapping(collections.namedtuple("_Mapping",
       ValueError: if mapping and any other arg is not `None`.
     """
     if mapping is None:
-      mapping = _Mapping(x=x, y=y, ildj=ildj,
-                         condition_kwargs=condition_kwargs)
-    elif not all(arg is None for arg in [x, y, ildj, condition_kwargs]):
+      mapping = _Mapping(x=x, y=y, ildj=ildj, kwargs=kwargs)
+    elif not all(arg is None for arg in [x, y, ildj, kwargs]):
       raise ValueError("Cannot specify mapping and individual args.")
     return _Mapping(
         x=self._merge(self.x, mapping.x),
         y=self._merge(self.y, mapping.y),
         ildj=self._merge(self.ildj, mapping.ildj),
-        condition_kwargs=self._merge(self.condition_kwargs,
-                                     mapping.condition_kwargs))
+        kwargs=self._merge(self.kwargs, mapping.kwargs))
 
   def _merge(self, old, new):
     """Helper to merge which handles merging one value."""
@@ -177,7 +165,7 @@ class Bijector(object):
   [diffeomorphism](https://en.wikipedia.org/wiki/Diffeomorphism), i.e., a
   bijective, differentiable function. A `Bijector` is used by
   `TransformedDistribution` but can be generally used for transforming a
-  `Distribution` generated `Tensor`.  A `Bijector` is characterized by three
+  `Distribution` generated `Tensor`. A `Bijector` is characterized by three
   operations:
 
   1. Forward Evaluation
@@ -195,7 +183,7 @@ class Bijector(object):
      "The log of the determinant of the matrix of all first-order partial
      derivatives of the inverse function."
      Useful for inverting a transformation to compute one probability in terms
-     of another.  Geometrically, the det(Jacobian) is the volume of the
+     of another. Geometrically, the det(Jacobian) is the volume of the
      transformation and is used to scale the probability.
 
   By convention, transformations of random variables are named in terms of the
@@ -207,7 +195,7 @@ class Bijector(object):
     - Basic properties:
 
     ```python
-    x = ... # A tensor.
+    x = ...  # A tensor.
     # Evaluate forward transformation.
     fwd_x = my_bijector.forward(x)
     x == my_bijector.inverse(fwd_x)
@@ -217,9 +205,9 @@ class Bijector(object):
     - Computing a log-likelihood:
 
     ```python
-    def transformed_log_pdf(bijector, log_pdf, x):
+    def transformed_log_prob(bijector, log_prob, x):
       return (bijector.inverse_log_det_jacobian(x) +
-              log_pdf(bijector.inverse(x)))
+              log_prob(bijector.inverse(x)))
     ```
 
     - Transforming a random outcome:
@@ -253,7 +241,7 @@ class Bijector(object):
       ```
         class Exp(Bijector):
           def __init__(self, event_ndims=0, validate_args=False, name="exp"):
-            super(Exp, self).__init__(batch_ndims=0, event_ndims=event_ndims,
+            super(Exp, self).__init__(event_ndims=event_ndims,
                                       validate_args=validate_args, name=name)
           def _forward(self, x):
             return math_ops.exp(x)
@@ -261,13 +249,13 @@ class Bijector(object):
             x = math_ops.log(y)
             return x, -self._forward_log_det_jacobian(x)
           def _forward_log_det_jacobian(self, x):
-            if self.shaper is None:
+            if self.event_ndims is None:
               raise ValueError("Jacobian requires known event_ndims.")
-            _, _, event_dims = self.shaper.get_dims(x)
-            return math_ops.reduce_sum(x, reduction_indices=event_dims)
+            event_dims = array_ops.shape(x)[-self.event_ndims:]
+            return math_ops.reduce_sum(x, axis=event_dims)
         ```
 
-    - "ScaleAndShift"
+    - "Affine"
 
       ```
       Y = g(X) = sqrtSigma * X + mu
@@ -289,8 +277,8 @@ class Bijector(object):
   partitioning:
 
   - Consider the `Exp` `Bijector` applied to a `Tensor` which has sample, batch,
-    and event (S, B, E) shape semantics.  Suppose
-    the `Tensor`'s partitioned-shape is `(S=[4], B=[2], E=[3, 3])`.
+    and event (S, B, E) shape semantics. Suppose the `Tensor`'s
+    partitioned-shape is `(S=[4], B=[2], E=[3, 3])`.
 
     For `Exp`, the shape of the `Tensor` returned by `forward` and `inverse` is
     unchanged, i.e., `[4, 2, 3, 3]`. However the shape returned by
@@ -305,7 +293,7 @@ class Bijector(object):
 
   - If the `Bijector`'s use is limited to `TransformedDistribution` (or friends
     like `QuantizedDistribution`) then depending on your use, you may not need
-    to implement all of `_forward` and `_inverese` functions.  Examples:
+    to implement all of `_forward` and `_inverse` functions. Examples:
       1. Sampling (e.g., `sample`) only requires `_forward`.
       2. Probability functions (e.g., `prob`, `cdf`, `survival`) only require
          `_inverse` (and related).
@@ -313,7 +301,7 @@ class Bijector(object):
         `_inverse` can be implemented as a cache lookup.
 
     See `Example Use` [above] which shows how these functions are used to
-    transform a distribution.  (Note: `_forward` could theoretically be
+    transform a distribution. (Note: `_forward` could theoretically be
     implemented as a cache lookup but this would require controlling the
     underlying sample generation mechanism.)
 
@@ -329,9 +317,10 @@ class Bijector(object):
     functions to avoid computing the `inverse_log_det_jacobian` or the
     `inverse`, respectively.
 
-  - Subclasses should implement `_get_forward_event_shape`,
-    `_forward_event_shape` (and `inverse` counterparts) if the transformation is
-    shape-changing.  By default the event-shape is assumed unchanged from input.
+  - Subclasses should implement `_forward_event_shape`,
+    `_forward_event_shape_tensor` (and `inverse` counterparts) if the
+    transformation is shape-changing. By default the event-shape is assumed
+    unchanged from input.
 
   Tips for implementing `_inverse` and `_inverse_log_det_jacobian`:
 
@@ -339,14 +328,14 @@ class Bijector(object):
     can be implemented as a cache lookup.
 
   - The inverse `log o det o Jacobian` can be implemented as the negative of the
-    forward `log o det o Jacobian`.  This is useful if the `inverse` is
+    forward `log o det o Jacobian`. This is useful if the `inverse` is
     implemented as a cache or the inverse Jacobian is computationally more
     expensive (e.g., `CholeskyOuterProduct` `Bijector`). The following
     demonstrates the suggested implementation.
 
     ```python
     def _inverse_and_log_det_jacobian(self, y):
-       x = # ... implement inverse, possibly via cache.
+       x = ...  # implement inverse, possibly via cache.
        return x, -self._forward_log_det_jac(x)  # Note negation.
     ```
 
@@ -385,9 +374,8 @@ class Bijector(object):
 
   @abc.abstractmethod
   def __init__(self,
-               batch_ndims=None,
                event_ndims=None,
-               parameters=None,
+               graph_parents=None,
                is_constant_jacobian=False,
                validate_args=False,
                dtype=None,
@@ -399,36 +387,31 @@ class Bijector(object):
     Examples:
 
     ```python
-    # Create the Y = g(X) = X transform which operates on 4-Tensors of vectors.
-    identity = Identity(batch_ndims=4, event_ndims=1)
+    # Create the Y = g(X) = X transform which operates on vector events.
+    identity = Identity(event_ndims=1)
 
     # Create the Y = g(X) = exp(X) transform which operates on matrices.
-    exp = Exp(batch_ndims=0, event_ndims=2)
+    exp = Exp(event_ndims=2)
     ```
 
     See `Bijector` subclass docstring for more details and specific examples.
 
     Args:
-      batch_ndims: number of dimensions associated with batch coordinates.
       event_ndims: number of dimensions associated with event coordinates.
-      parameters: Dictionary of parameters used by this `Bijector`
-      is_constant_jacobian: `Boolean` indicating that the Jacobian is not a
+      graph_parents: Python list of graph prerequisites of this `Bijector`.
+      is_constant_jacobian: Python `bool` indicating that the Jacobian is not a
         function of the input.
-      validate_args: `Boolean`, default `False`.  Whether to validate input with
-        asserts. If `validate_args` is `False`, and the inputs are invalid,
+      validate_args: Python `bool`, default `False`. Whether to validate input
+        with asserts. If `validate_args` is `False`, and the inputs are invalid,
         correct behavior is not guaranteed.
       dtype: `tf.dtype` supported by this `Bijector`. `None` means dtype is not
         enforced.
       name: The name to give Ops created by the initializer.
     """
-    if batch_ndims is None or event_ndims is None:
-      self._shaper = None  # Apparently subclass will create.
-    else:
-      self._shaper = _DistributionShape(
-          batch_ndims=batch_ndims,
-          event_ndims=event_ndims,
-          validate_args=validate_args)
-    self._parameters = parameters or {}
+    self._event_ndims = (
+        ops.convert_to_tensor(event_ndims, dtype=dtypes.int32)
+        if event_ndims is not None else None)
+    self._graph_parents = graph_parents or []
     self._is_constant_jacobian = is_constant_jacobian
     self._validate_args = validate_args
     self._dtype = dtype
@@ -441,21 +424,21 @@ class Bijector(object):
       self._name = name
     else:
       # We want the default convention to be snake_case rather than CamelCase
-      # since `Chain` uses bijector.name as the condition_kwargs dictionary key.
+      # since `Chain` uses bijector.name as the kwargs dictionary key.
       def camel_to_snake(name):
         s1 = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
         return re.sub("([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
-      self._name = camel_to_snake(type(self).__name__)
+      self._name = camel_to_snake(type(self).__name__.lstrip("_"))
 
   @property
-  def shaper(self):
-    """Returns shape object used to manage shape constraints."""
-    return self._shaper
+  def event_ndims(self):
+    """Returns then number of event dimensions this bijector operates on."""
+    return self._event_ndims
 
   @property
-  def parameters(self):
-    """Returns this `Bijector`'s parameters as a name/value dictionary."""
-    return self._parameters
+  def graph_parents(self):
+    """Returns this `Bijector`'s graph_parents as a Python list."""
+    return self._graph_parents
 
   @property
   def is_constant_jacobian(self):
@@ -464,7 +447,7 @@ class Bijector(object):
     Note: Jacobian is either constant for both forward and inverse or neither.
 
     Returns:
-      `Boolean`.
+      is_constant_jacobian: Python `bool`.
     """
     return self._is_constant_jacobian
 
@@ -483,11 +466,14 @@ class Bijector(object):
     """Returns the string name of this `Bijector`."""
     return self._name
 
-  def _forward_event_shape(self, input_shape):
-    """Subclass implementation for `forward_event_shape` public function."""
+  def _forward_event_shape_tensor(self, input_shape):
+    """Subclass implementation for `forward_event_shape_tensor` function."""
+    # By default, we assume event_shape is unchanged.
     return input_shape
 
-  def forward_event_shape(self, input_shape, name="forward_event_shape"):
+  def forward_event_shape_tensor(self,
+                                 input_shape,
+                                 name="forward_event_shape_tensor"):
     """Shape of a single sample from a single batch as an `int32` 1D `Tensor`.
 
     Args:
@@ -496,38 +482,42 @@ class Bijector(object):
       name: name to give to the op
 
     Returns:
-      forward_event_shape: `Tensor`, `int32` vector indicating event-portion
-        shape after applying `forward`.
+      forward_event_shape_tensor: `Tensor`, `int32` vector indicating
+        event-portion shape after applying `forward`.
     """
     with self._name_scope(name, [input_shape]):
       input_shape = ops.convert_to_tensor(input_shape, dtype=dtypes.int32,
                                           name="input_shape")
-      return self._forward_event_shape(input_shape)
+      return self._forward_event_shape_tensor(input_shape)
 
-  def _get_forward_event_shape(self, input_shape):
-    """Subclass implementation for `get_forward_event_shape` public function."""
+  def _forward_event_shape(self, input_shape):
+    """Subclass implementation for `forward_event_shape` public function."""
+    # By default, we assume event_shape is unchanged.
     return input_shape
 
-  def get_forward_event_shape(self, input_shape):
+  def forward_event_shape(self, input_shape):
     """Shape of a single sample from a single batch as a `TensorShape`.
 
-    Same meaning as `forward_event_shape`. May be only partially defined.
+    Same meaning as `forward_event_shape_tensor`. May be only partially defined.
 
     Args:
       input_shape: `TensorShape` indicating event-portion shape passed into
         `forward` function.
 
     Returns:
-      forward_event_shape: `TensorShape` indicating event-portion shape after
-        applying `forward`. Possibly unknown.
+      forward_event_shape_tensor: `TensorShape` indicating event-portion shape
+        after applying `forward`. Possibly unknown.
     """
-    return self._get_forward_event_shape(tensor_shape.TensorShape(input_shape))
+    return self._forward_event_shape(tensor_shape.TensorShape(input_shape))
 
-  def _inverse_event_shape(self, output_shape):
-    """Subclass implementation for `inverse_event_shape` public function."""
+  def _inverse_event_shape_tensor(self, output_shape):
+    """Subclass implementation for `inverse_event_shape_tensor` function."""
+    # By default, we assume event_shape is unchanged.
     return output_shape
 
-  def inverse_event_shape(self, output_shape, name="inverse_event_shape"):
+  def inverse_event_shape_tensor(self,
+                                 output_shape,
+                                 name="inverse_event_shape_tensor"):
     """Shape of a single sample from a single batch as an `int32` 1D `Tensor`.
 
     Args:
@@ -536,44 +526,55 @@ class Bijector(object):
       name: name to give to the op
 
     Returns:
-      inverse_event_shape: `Tensor`, `int32` vector indicating event-portion
-        shape after applying `inverse`.
+      inverse_event_shape_tensor: `Tensor`, `int32` vector indicating
+        event-portion shape after applying `inverse`.
     """
     with self._name_scope(name, [output_shape]):
       output_shape = ops.convert_to_tensor(output_shape, dtype=dtypes.int32,
                                            name="output_shape")
-      return self._inverse_event_shape(output_shape)
+      return self._inverse_event_shape_tensor(output_shape)
 
-  def _get_inverse_event_shape(self, output_shape):
-    """Subclass implementation for `get_inverse_event_shape` public function."""
-    return self._get_inverse_event_shape(tensor_shape.TensorShape(output_shape))
+  def _inverse_event_shape(self, output_shape):
+    """Subclass implementation for `inverse_event_shape` public function."""
+    # By default, we assume event_shape is unchanged.
+    return tensor_shape.TensorShape(output_shape)
 
-  def get_inverse_event_shape(self, output_shape):
+  def inverse_event_shape(self, output_shape):
     """Shape of a single sample from a single batch as a `TensorShape`.
 
-    Same meaning as `inverse_event_shape`. May be only partially defined.
+    Same meaning as `inverse_event_shape_tensor`. May be only partially defined.
 
     Args:
       output_shape: `TensorShape` indicating event-portion shape passed into
         `inverse` function.
 
     Returns:
-      inverse_event_shape: `TensorShape` indicating event-portion shape after
-        applying `inverse`. Possibly unknown.
+      inverse_event_shape_tensor: `TensorShape` indicating event-portion shape
+        after applying `inverse`. Possibly unknown.
     """
-    return self._get_inverse_event_shape(output_shape)
+    return self._inverse_event_shape(output_shape)
 
   def _forward(self, x):
     """Subclass implementation for `forward` public function."""
     raise NotImplementedError("forward not implemented.")
 
-  def forward(self, x, name="forward", **condition_kwargs):
+  def _call_forward(self, x, name, **kwargs):
+    with self._name_scope(name, [x]):
+      x = ops.convert_to_tensor(x, name="x")
+      self._maybe_assert_dtype(x)
+      mapping = self._lookup(x=x, kwargs=kwargs)
+      if mapping.y is not None:
+        return mapping.y
+      mapping = mapping.merge(y=self._forward(x, **kwargs))
+      self._cache(mapping)
+      return mapping.y
+
+  def forward(self, x, name="forward"):
     """Returns the forward `Bijector` evaluation, i.e., X = g(Y).
 
     Args:
       x: `Tensor`. The input to the "forward" evaluation.
       name: The name to give this op.
-      **condition_kwargs: Named arguments forwarded to subclass implementation.
 
     Returns:
       `Tensor`.
@@ -583,52 +584,27 @@ class Bijector(object):
         `self.dtype`.
       NotImplementedError: if `_forward` is not implemented.
     """
-    with self._name_scope(name, [x]):
-      x = ops.convert_to_tensor(x, name="x")
-      self._maybe_assert_dtype(x)
-      mapping = self._lookup(x=x, condition_kwargs=condition_kwargs)
-      if mapping.y is not None:
-        return mapping.y
-      mapping = mapping.merge(y=self._forward(x, **condition_kwargs))
-      self._cache(mapping)
-      return mapping.y
+    return self._call_forward(x, name)
 
   def _inverse(self, y):
     """Subclass implementation for `inverse` public function."""
     raise NotImplementedError("inverse not implemented")
 
-  def inverse(self, y, name="inverse", **condition_kwargs):
-    """Returns the inverse `Bijector` evaluation, i.e., X = g^{-1}(Y).
-
-    Args:
-      y: `Tensor`. The input to the "inverse" evaluation.
-      name: The name to give this op.
-      **condition_kwargs: Named arguments forwarded to subclass implementation.
-
-    Returns:
-      `Tensor`.
-
-    Raises:
-      TypeError: if `self.dtype` is specified and `y.dtype` is not
-        `self.dtype`.
-      NotImplementedError: if neither `_inverse` nor
-        `_inverse_and_inverse_log_det_jacobian` are implemented.
-    """
+  def _call_inverse(self, y, name, **kwargs):
     with self._name_scope(name, [y]):
       y = ops.convert_to_tensor(y, name="y")
       self._maybe_assert_dtype(y)
-      mapping = self._lookup(y=y, condition_kwargs=condition_kwargs)
+      mapping = self._lookup(y=y, kwargs=kwargs)
       if mapping.x is not None:
         return mapping.x
       ildj = None
       try:
-        x = self._inverse(y, **condition_kwargs)
+        x = self._inverse(y, **kwargs)
       except NotImplementedError as original_error:
         # Since _inverse was not implemented, try to see if it's implemented
         # by the _inverse_and_inverse_log_det_jacobian member.
         try:
-          x, ildj = self._inverse_and_inverse_log_det_jacobian(
-              y, **condition_kwargs)
+          x, ildj = self._inverse_and_inverse_log_det_jacobian(y, **kwargs)
         except NotImplementedError:
           raise original_error
         if self._constant_ildj is not None:
@@ -640,22 +616,12 @@ class Bijector(object):
       self._cache(mapping)
       return mapping.x
 
-  def _inverse_log_det_jacobian(self, y):
-    """Subclass implementation for `inverse_log_det_jacobian` public function."""  # pylint: disable=line-too-long
-    raise NotImplementedError("inverse_log_det_jacobian not implemented.")
-
-  def inverse_log_det_jacobian(
-      self, y, name="inverse_log_det_jacobian", **condition_kwargs):
-    """Returns the (log o det o Jacobian o inverse)(y).
-
-    Mathematically, returns: `log(det(dX/dY))(Y)`. (Recall that: `X=g^{-1}(Y)`.)
-
-    Note that `forward_log_det_jacobian` is the negative of this function.
+  def inverse(self, y, name="inverse"):
+    """Returns the inverse `Bijector` evaluation, i.e., X = g^{-1}(Y).
 
     Args:
-      y: `Tensor`. The input to the "inverse" Jacobian evaluation.
+      y: `Tensor`. The input to the "inverse" evaluation.
       name: The name to give this op.
-      **condition_kwargs: Named arguments forwarded to subclass implementation.
 
     Returns:
       `Tensor`.
@@ -663,26 +629,32 @@ class Bijector(object):
     Raises:
       TypeError: if `self.dtype` is specified and `y.dtype` is not
         `self.dtype`.
-      NotImplementedError: if neither `_inverse_log_det_jacobian` nor
+      NotImplementedError: if neither `_inverse` nor
         `_inverse_and_inverse_log_det_jacobian` are implemented.
     """
+    return self._call_inverse(y, name)
+
+  def _inverse_log_det_jacobian(self, y):
+    """Subclass implementation of `inverse_log_det_jacobian` public function."""
+    raise NotImplementedError("inverse_log_det_jacobian not implemented.")
+
+  def _call_inverse_log_det_jacobian(self, y, name, **kwargs):
     with self._name_scope(name, [y]):
       if self._constant_ildj is not None:
         return self._constant_ildj
       y = ops.convert_to_tensor(y, name="y")
       self._maybe_assert_dtype(y)
-      mapping = self._lookup(y=y, condition_kwargs=condition_kwargs)
+      mapping = self._lookup(y=y, kwargs=kwargs)
       if mapping.ildj is not None:
         return mapping.ildj
       try:
         x = mapping.x
-        ildj = self._inverse_log_det_jacobian(y, **condition_kwargs)
+        ildj = self._inverse_log_det_jacobian(y, **kwargs)
       except NotImplementedError as original_error:
         # Since _inverse_log_det_jacobian was not implemented, try to see if
         # it's implemented by the _inverse_and_inverse_log_det_jacobian member.
         try:
-          x, ildj = self._inverse_and_inverse_log_det_jacobian(
-              y, **condition_kwargs)
+          x, ildj = self._inverse_and_inverse_log_det_jacobian(y, **kwargs)
         except NotImplementedError:
           raise original_error
         if mapping.x is not None:
@@ -694,13 +666,67 @@ class Bijector(object):
       self._cache(mapping)
       return mapping.ildj
 
+  def inverse_log_det_jacobian(self, y, name="inverse_log_det_jacobian"):
+    """Returns the (log o det o Jacobian o inverse)(y).
+
+    Mathematically, returns: `log(det(dX/dY))(Y)`. (Recall that: `X=g^{-1}(Y)`.)
+
+    Note that `forward_log_det_jacobian` is the negative of this function.
+
+    Args:
+      y: `Tensor`. The input to the "inverse" Jacobian evaluation.
+      name: The name to give this op.
+
+    Returns:
+      `Tensor`.
+
+    Raises:
+      TypeError: if `self.dtype` is specified and `y.dtype` is not
+        `self.dtype`.
+      NotImplementedError: if neither `_inverse_log_det_jacobian` nor
+        `_inverse_and_inverse_log_det_jacobian` are implemented.
+    """
+    return self._call_inverse_log_det_jacobian(y, name)
+
   def _inverse_and_inverse_log_det_jacobian(self, y):
-    """Subclass implementation for `inverse_and_inverse_log_det_jacobian` public function."""  # pylint: disable=line-too-long
+    """Subclass implementation of `inverse_and_inverse_log_det_jacobian`."""
     raise NotImplementedError(
         "inverse_and_inverse_log_det_jacobian not implemented.")
 
+  def _call_inverse_and_inverse_log_det_jacobian(self, y, name, **kwargs):
+    with self._name_scope(name, [y]):
+      y = ops.convert_to_tensor(y, name="y")
+      self._maybe_assert_dtype(y)
+      mapping = self._lookup(y=y, kwargs=kwargs)
+      if mapping.x is not None and mapping.ildj is not None:
+        return mapping.x, mapping.ildj
+      try:
+        x, ildj = self._inverse_and_inverse_log_det_jacobian(y, **kwargs)
+      except NotImplementedError as original_error:
+        # Since _inverse_and_inverse_log_det_jacobian was not implemented, try
+        # to see if we can separately use _inverse and
+        # _inverse_log_det_jacobian members.
+        try:
+          # We want this same try/except to catch either NotImplementedError.
+          x = self._inverse(y, **kwargs)
+          if self._constant_ildj is None:
+            ildj = self._inverse_log_det_jacobian(y, **kwargs)
+        except NotImplementedError:
+          raise original_error
+      if self._constant_ildj is not None:
+        ildj = self._constant_ildj  # Ignore any ildj we may/not have.
+      elif self.is_constant_jacobian:
+        self._constant_ildj = ildj
+      # We use the mapped version of x, even if we re-computed x above with a
+      # call to self._inverse_and_inverse_log_det_jacobian. This prevents
+      # re-evaluation of the inverse in a common case.
+      x = x if mapping.x is None else mapping.x
+      mapping = mapping.merge(x=x, ildj=ildj)
+      self._cache(mapping)
+      return mapping.x, mapping.ildj
+
   def inverse_and_inverse_log_det_jacobian(
-      self, y, name="inverse_and_inverse_log_det_jacobian", **condition_kwargs):
+      self, y, name="inverse_and_inverse_log_det_jacobian"):
     """Returns both the inverse evaluation and inverse_log_det_jacobian.
 
     Enables possibly more efficient calculation when both inverse and
@@ -711,7 +737,6 @@ class Bijector(object):
     Args:
       y: `Tensor`. The input to the "inverse" Jacobian evaluation.
       name: The name to give this op.
-      **condition_kwargs: Named arguments forwarded to subclass implementation.
 
     Returns:
       `Tensor`.
@@ -722,51 +747,47 @@ class Bijector(object):
       NotImplementedError: if neither `_inverse_and_inverse_log_det_jacobian`
         nor {`_inverse`, `_inverse_log_det_jacobian`} are implemented.
     """
-    with self._name_scope(name, [y]):
-      y = ops.convert_to_tensor(y, name="y")
-      self._maybe_assert_dtype(y)
-      mapping = self._lookup(y=y, condition_kwargs=condition_kwargs)
-      if mapping.x is not None and mapping.ildj is not None:
-        return mapping.x, mapping.ildj
-      try:
-        x, ildj = self._inverse_and_inverse_log_det_jacobian(
-            y, **condition_kwargs)
-      except NotImplementedError as original_error:
-        # Since _inverse_and_inverse_log_det_jacobian was not implemented, try
-        # to see if we can separately use _inverse and
-        # _inverse_log_det_jacobian members.
-        try:
-          # We want this same try/except to catch either NotImplementedError.
-          x = self._inverse(y, **condition_kwargs)
-          if self._constant_ildj is None:
-            ildj = self._inverse_log_det_jacobian(y, **condition_kwargs)
-        except NotImplementedError:
-          raise original_error
-      if self._constant_ildj is not None:
-        ildj = self._constant_ildj  # Ignore any ildj we may/not have.
-      elif self.is_constant_jacobian:
-        self._constant_ildj = ildj
-      # We use the mapped version of x, even if we re-computed x above with a
-      # call to self._inverse_and_inverse_log_det_jacobian.  This prevents
-      # re-evaluation of the inverse in a common case.
-      x = x if mapping.x is None else mapping.x
-      mapping = mapping.merge(x=x, ildj=ildj)
-      self._cache(mapping)
-      return mapping.x, mapping.ildj
+    return self._call_inverse_and_inverse_log_det_jacobian(y, name)
 
   def _forward_log_det_jacobian(self, x):
-    """Subclass implementation for `forward_log_det_jacobian` public function."""  # pylint: disable=line-too-long
+    """Subclass implementation of `forward_log_det_jacobian`."""
     raise NotImplementedError(
         "forward_log_det_jacobian not implemented.")
 
-  def forward_log_det_jacobian(
-      self, x, name="forward_log_det_jacobian", **condition_kwargs):
+  def _call_forward_log_det_jacobian(self, x, name, **kwargs):
+    with self._name_scope(name, [x]):
+      if self._constant_ildj is not None:
+        # Need "-1. *" to avoid invalid-unary-operand-type linter warning.
+        return -1. * self._constant_ildj
+      x = ops.convert_to_tensor(x, name="x")
+      self._maybe_assert_dtype(x)
+      mapping = self._lookup(x=x, kwargs=kwargs)
+      if mapping.ildj is not None:
+        return -mapping.ildj
+      y = None
+      try:
+        ildj = -self._forward_log_det_jacobian(x, **kwargs)
+      except NotImplementedError as original_error:
+        try:
+          # We want this same try/except to catch either NotImplementedError.
+          # TODO(langmore) Add test that covers this branch.
+          y = self.forward(x, **kwargs) if y is None else y
+          ildj = self.inverse_log_det_jacobian(y, **kwargs)
+        except NotImplementedError:
+          raise original_error
+      if self.is_constant_jacobian:
+        self._constant_ildj = ildj
+      y = y if mapping.y is None else mapping.y
+      mapping = mapping.merge(y=y, ildj=ildj)
+      self._cache(mapping)
+      return -mapping.ildj
+
+  def forward_log_det_jacobian(self, x, name="forward_log_det_jacobian"):
     """Returns both the forward_log_det_jacobian.
 
     Args:
       x: `Tensor`. The input to the "forward" Jacobian evaluation.
       name: The name to give this op.
-      **condition_kwargs: Named arguments forwarded to subclass implementation.
 
     Returns:
       `Tensor`.
@@ -777,38 +798,14 @@ class Bijector(object):
       NotImplementedError: if neither `_forward_log_det_jacobian`
         nor {`_inverse`, `_inverse_log_det_jacobian`} are implemented.
     """
-    with self._name_scope(name, [x]):
-      if self._constant_ildj is not None:
-        # Need "-1. *" to avoid invalid-unary-operand-type linter warning.
-        return -1. * self._constant_ildj
-      x = ops.convert_to_tensor(x, name="x")
-      self._maybe_assert_dtype(x)
-      mapping = self._lookup(x=x, condition_kwargs=condition_kwargs)
-      if mapping.ildj is not None:
-        return -mapping.ildj
-      y = None
-      try:
-        ildj = -self._forward_log_det_jacobian(x, **condition_kwargs)
-      except NotImplementedError as original_error:
-        try:
-          # We want this same try/except to catch either NotImplementedError.
-          y = self.inverse(x, **condition_kwargs) if y is None else y
-          ildj = self.inverse_log_det_jacobian(y, **condition_kwargs)
-        except NotImplementedError:
-          raise original_error
-      if self.is_constant_jacobian:
-        self._constant_ildj = ildj
-      y = y if mapping.y is None else mapping.y
-      mapping = mapping.merge(y=y, ildj=ildj)
-      self._cache(mapping)
-      return -mapping.ildj
+    return self._call_forward_log_det_jacobian(x, name)
 
   @contextlib.contextmanager
   def _name_scope(self, name=None, values=None):
     """Helper function to standardize op scope."""
     with ops.name_scope(self.name):
-      with ops.name_scope(name, values=(
-          (values or []) + list(self.parameters.values()))) as scope:
+      with ops.name_scope(
+          name, values=(values or []) + self.graph_parents) as scope:
         yield scope
 
   def _maybe_assert_dtype(self, x):
@@ -825,16 +822,16 @@ class Bijector(object):
     # Merging from lookup is an added check that we're not overwriting anything
     # which is not None.
     mapping = mapping.merge(mapping=self._lookup(
-        mapping.x, mapping.y, mapping.condition_kwargs))
+        mapping.x, mapping.y, mapping.kwargs))
     if mapping.x is None and mapping.y is None:
       raise ValueError("Caching expects at least one of (x,y) to be known, "
                        "i.e., not None.")
     self._from_x[mapping.x_key] = mapping
     self._from_y[mapping.y_key] = mapping
 
-  def _lookup(self, x=None, y=None, condition_kwargs=None):
+  def _lookup(self, x=None, y=None, kwargs=None):
     """Helper which retrieves mapping info from forward/inverse dicts."""
-    mapping = _Mapping(x=x, y=y, condition_kwargs=condition_kwargs)
+    mapping = _Mapping(x=x, y=y, kwargs=kwargs)
     # Since _cache requires both x,y to be set, we only need to do one cache
     # lookup since the mapping is always in both or neither.
     if mapping.x is not None:
@@ -843,10 +840,29 @@ class Bijector(object):
       return self._from_y.get(mapping.y_key, mapping)
     return mapping
 
+  def _event_dims_tensor(self, sample):
+    """Return a 1D `int32` tensor: `range(rank(sample))[-event_ndims:]`."""
+    if self.event_ndims is None:
+      raise ValueError("Jacobian cannot be computed with unknown event_ndims")
+    static_event_ndims = tensor_util.constant_value(self.event_ndims)
+    static_rank = sample.get_shape().ndims
+    if static_event_ndims is not None and static_rank is not None:
+      return ops.convert_to_tensor(
+          static_rank + np.arange(-static_event_ndims, 0).astype(np.int32))
+
+    if static_event_ndims is not None:
+      event_range = np.arange(-static_event_ndims, 0).astype(np.int32)
+    else:
+      event_range = math_ops.range(-self.event_ndims, 0, dtype=dtypes.int32)
+
+    if static_rank is not None:
+      return event_range + static_rank
+    else:
+      return event_range + array_ops.rank(sample)
+
 
 class Inline(Bijector):
-  # pylint: disable=line-too-long
-  """Bijector constructed from callables implementing forward, inverse, and inverse_log_det_jacobian.
+  """Bijector constructed from custom callables.
 
   Example Use:
 
@@ -855,23 +871,22 @@ class Inline(Bijector):
     forward_fn=tf.exp,
     inverse_fn=tf.log,
     inverse_log_det_jacobian_fn=(
-      lambda y: -tf.reduce_sum(tf.log(y), reduction_indices=-1)),
+      lambda y: -tf.reduce_sum(tf.log(y), axis=-1)),
     name="exp")
   ```
 
   The above example is equivalent to the `Bijector` `Exp(event_ndims=1)`.
   """
-  # pylint: enable=line-too-long
 
   def __init__(self,
                forward_fn=None,
                inverse_fn=None,
                inverse_log_det_jacobian_fn=None,
                forward_log_det_jacobian_fn=None,
-               get_forward_event_shape_fn=None,
                forward_event_shape_fn=None,
-               get_inverse_event_shape_fn=None,
+               forward_event_shape_tensor_fn=None,
                inverse_event_shape_fn=None,
+               inverse_event_shape_tensor_fn=None,
                is_constant_jacobian=False,
                validate_args=False,
                name="inline"):
@@ -884,22 +899,21 @@ class Inline(Bijector):
         log o det o jacobian of the inverse transformation.
       forward_log_det_jacobian_fn: Python callable implementing the
         log o det o jacobian of the forward transformation.
-      get_forward_event_shape_fn: Python callable implementing non-identical
+      forward_event_shape_fn: Python callable implementing non-identical
         static event shape changes. Default: shape is assumed unchanged.
-      forward_event_shape_fn: Python callable implementing non-identical event
-        shape changes. Default: shape is assumed unchanged.
-      get_inverse_event_shape_fn: Python callable implementing non-identical
+      forward_event_shape_tensor_fn: Python callable implementing non-identical
+        event shape changes. Default: shape is assumed unchanged.
+      inverse_event_shape_fn: Python callable implementing non-identical
         static event shape changes. Default: shape is assumed unchanged.
-      inverse_event_shape_fn: Python callable implementing non-identical event
-        shape changes. Default: shape is assumed unchanged.
-      is_constant_jacobian: `Boolean` indicating that the Jacobian is constant
-        for all input arguments.
-      validate_args: `Boolean` indicating whether arguments should be checked
-        for correctness.
-      name: `String`, name given to ops managed by this object.
+      inverse_event_shape_tensor_fn: Python callable implementing non-identical
+        event shape changes. Default: shape is assumed unchanged.
+      is_constant_jacobian: Python `bool` indicating that the Jacobian is
+        constant for all input arguments.
+      validate_args: Python `bool` indicating whether arguments should be
+        checked for correctness.
+      name: Python `str`, name given to ops managed by this object.
     """
     super(Inline, self).__init__(
-        batch_ndims=0,
         event_ndims=0,
         is_constant_jacobian=is_constant_jacobian,
         validate_args=validate_args,
@@ -908,16 +922,10 @@ class Inline(Bijector):
     self._inverse_fn = inverse_fn
     self._inverse_log_det_jacobian_fn = inverse_log_det_jacobian_fn
     self._forward_log_det_jacobian_fn = forward_log_det_jacobian_fn
-    self._get_forward_event_shape_fn = get_forward_event_shape_fn
     self._forward_event_shape_fn = forward_event_shape_fn
-    self._get_inverse_event_shape_fn = get_inverse_event_shape_fn
+    self._forward_event_shape_tensor_fn = forward_event_shape_tensor_fn
     self._inverse_event_shape_fn = inverse_event_shape_fn
-
-  def _get_forward_event_shape(self, input_shape):
-    if self._get_forward_event_shape_fn is None:
-      # By default assume shape doesn't change.
-      return input_shape
-    return self._get_forward_event_shape_fn(input_shape)
+    self._inverse_event_shape_tensor_fn = inverse_event_shape_tensor_fn
 
   def _forward_event_shape(self, input_shape):
     if self._forward_event_shape_fn is None:
@@ -925,11 +933,11 @@ class Inline(Bijector):
       return input_shape
     return self._forward_event_shape_fn(input_shape)
 
-  def _get_inverse_event_shape(self, output_shape):
-    if self._get_inverse_event_shape_fn is None:
+  def _forward_event_shape_tensor(self, input_shape):
+    if self._forward_event_shape_tensor_fn is None:
       # By default assume shape doesn't change.
-      return output_shape
-    return self._get_inverse_event_shape_fn(output_shape)
+      return input_shape
+    return self._forward_event_shape_tensor_fn(input_shape)
 
   def _inverse_event_shape(self, output_shape):
     if self._inverse_event_shape_fn is None:
@@ -937,29 +945,35 @@ class Inline(Bijector):
       return output_shape
     return self._inverse_event_shape_fn(output_shape)
 
-  def _forward(self, x, **condition_kwargs):
+  def _inverse_event_shape_tensor(self, output_shape):
+    if self._inverse_event_shape_tensor_fn is None:
+      # By default assume shape doesn't change.
+      return output_shape
+    return self._inverse_event_shape_tensor_fn(output_shape)
+
+  def _forward(self, x, **kwargs):
     if not callable(self._forward_fn):
       raise NotImplementedError(
           "forward_fn is not a callable function.")
-    return self._forward_fn(x, **condition_kwargs)
+    return self._forward_fn(x, **kwargs)
 
-  def _inverse(self, y, **condition_kwargs):
+  def _inverse(self, y, **kwargs):
     if not callable(self._inverse_fn):
       raise NotImplementedError(
           "inverse_fn is not a callable function.")
-    return self._inverse_fn(y, **condition_kwargs)
+    return self._inverse_fn(y, **kwargs)
 
-  def _inverse_log_det_jacobian(self, y, **condition_kwargs):
+  def _inverse_log_det_jacobian(self, y, **kwargs):
     if not callable(self._inverse_log_det_jacobian_fn):
       raise NotImplementedError(
           "inverse_log_det_jacobian_fn is not a callable function.")
-    return self._inverse_log_det_jacobian_fn(y, **condition_kwargs)
+    return self._inverse_log_det_jacobian_fn(y, **kwargs)
 
-  def _forward_log_det_jacobian(self, y, **condition_kwargs):
+  def _forward_log_det_jacobian(self, y, **kwargs):
     if not callable(self._forward_log_det_jacobian_fn):
       raise NotImplementedError(
           "forward_log_det_jacobian_fn is not a callable function.")
-    return self._forward_log_det_jacobian_fn(y, **condition_kwargs)
+    return self._forward_log_det_jacobian_fn(y, **kwargs)
 
 
 class Invert(Bijector):
@@ -971,8 +985,8 @@ class Invert(Bijector):
 
   ```python
   exp_gamma_distribution = TransformedDistribution(
-    Gamma(alpha=1., beta=2.),
-    bijector.Invert(bijector.Exp())
+    distribution=Gamma(concentration=1., rate=2.),
+    bijector=bijector.Invert(bijector.Exp())
   ```
 
   """
@@ -986,51 +1000,51 @@ class Invert(Bijector):
     used:
 
     ```python
-    y = self.inverse(x, **condition_kwargs)
-    return -self.inverse_log_det_jacobian(y, **condition_kwargs)
+    y = self.inverse(x, **kwargs)
+    return -self.inverse_log_det_jacobian(y, **kwargs)
     ```
 
     Args:
       bijector: Bijector instance.
-      validate_args: `Boolean` indicating whether arguments should be checked
-        for correctness.
-      name: `String`, name given to ops managed by this object.
+      validate_args: Python `bool` indicating whether arguments should be
+        checked for correctness.
+      name: Python `str`, name given to ops managed by this object.
     """
 
     self._bijector = bijector
     super(Invert, self).__init__(
-        parameters=bijector.parameters,
+        event_ndims=bijector.event_ndims,
+        graph_parents=bijector.graph_parents,
         is_constant_jacobian=bijector.is_constant_jacobian,
         validate_args=validate_args,
         dtype=bijector.dtype,
         name=name or "_".join(["invert", bijector.name]))
-    self._shaper = bijector.shaper
-
-  def _get_forward_event_shape(self, input_shape):
-    return self.bijector.get_inverse_event_shape(input_shape)
 
   def _forward_event_shape(self, input_shape):
     return self.bijector.inverse_event_shape(input_shape)
 
-  def _get_inverse_event_shape(self, output_shape):
-    return self.bijector.get_forward_event_shape(output_shape)
+  def _forward_event_shape_tensor(self, input_shape):
+    return self.bijector.inverse_event_shape_tensor(input_shape)
 
   def _inverse_event_shape(self, output_shape):
     return self.bijector.forward_event_shape(output_shape)
+
+  def _inverse_event_shape_tensor(self, output_shape):
+    return self.bijector.forward_event_shape_tensor(output_shape)
 
   @property
   def bijector(self):
     return self._bijector
 
-  def _forward(self, x, **condition_kwargs):
-    return self.bijector.inverse(x, **condition_kwargs)
+  def _forward(self, x, **kwargs):
+    return self.bijector.inverse(x, **kwargs)
 
-  def _inverse_and_inverse_log_det_jacobian(self, y, **condition_kwargs):
-    return (self.bijector.forward(y, **condition_kwargs),
-            self.bijector.forward_log_det_jacobian(y, **condition_kwargs))
+  def _inverse_and_inverse_log_det_jacobian(self, y, **kwargs):
+    return (self.bijector.forward(y, **kwargs),
+            self.bijector.forward_log_det_jacobian(y, **kwargs))
 
-  def _forward_log_det_jacobian(self, x, **condition_kwargs):
-    return self.bijector.inverse_log_det_jacobian(x, **condition_kwargs)
+  def _forward_log_det_jacobian(self, x, **kwargs):
+    return self.bijector.inverse_log_det_jacobian(x, **kwargs)
 
 
 class Chain(Bijector):
@@ -1074,36 +1088,35 @@ class Chain(Bijector):
     Args:
       bijectors: Python list of bijector instances. An empty list makes this
         bijector equivalent to the `Identity` bijector.
-      validate_args: `Boolean` indicating whether arguments should be checked
-        for correctness.
-      name: `String`, name given to ops managed by this object. Default: E.g.,
-        `Chain([Exp(), Softplus()]).name == "chain_of_exp_of_softplus"`.
+      validate_args: Python `bool` indicating whether arguments should be
+        checked for correctness.
+      name: Python `str`, name given to ops managed by this object. Default:
+        E.g., `Chain([Exp(), Softplus()]).name == "chain_of_exp_of_softplus"`.
 
     Raises:
       ValueError: if bijectors have different dtypes.
     """
-
     self._bijectors = bijectors
-
     dtype = list(set([b.dtype for b in bijectors]))
     if len(dtype) > 2:
       raise ValueError("incompatible dtypes: %s" % dtype)
     elif len(dtype) == 2:
       dtype = dtype[1] if dtype[0] is None else dtype[0]
+      event_ndims = bijectors[0].event_ndims
     elif len(dtype) == 1:
       dtype = dtype[0]
+      event_ndims = bijectors[0].event_ndims
     else:
       dtype = None
+      event_ndims = None
 
-    parameters = {}
-    for b in bijectors:
-      parameters.update(("{}={}".format(b.name, k), v)
-                        for k, v in b.parameters.items())
     super(Chain, self).__init__(
-        parameters=parameters,
+        graph_parents=list(itertools.chain.from_iterable(
+            b.graph_parents for b in bijectors)),
         is_constant_jacobian=all(b.is_constant_jacobian for b in bijectors),
         validate_args=validate_args,
         dtype=dtype,
+        event_ndims=event_ndims,
         name=name or ("identity" if not bijectors else
                       "_of_".join(["chain"] + [b.name for b in bijectors])))
 
@@ -1121,57 +1134,57 @@ class Chain(Bijector):
       new_shape = func(new_shape)
     return new_shape
 
-  def _get_forward_event_shape(self, input_shape):
-    return self._shape_helper("get_forward_event_shape", input_shape,
+  def _forward_event_shape(self, input_shape):
+    return self._shape_helper("forward_event_shape", input_shape,
                               reverse=True)
 
-  def _forward_event_shape(self, input_shape):
-    return self._shape_helper("forward_event_shape", input_shape, reverse=True)
-
-  def _get_inverse_event_shape(self, output_shape):
-    return self._shape_helper("get_inverse_event_shape", output_shape,
-                              reverse=False)
+  def _forward_event_shape_tensor(self, input_shape):
+    return self._shape_helper(
+        "forward_event_shape_tensor", input_shape, reverse=True)
 
   def _inverse_event_shape(self, output_shape):
     return self._shape_helper("inverse_event_shape", output_shape,
                               reverse=False)
 
-  def _forward(self, x, **condition_kwargs):
+  def _inverse_event_shape_tensor(self, output_shape):
+    return self._shape_helper("inverse_event_shape_tensor", output_shape,
+                              reverse=False)
+
+  def _forward(self, x, **kwargs):
     y = x
     for b in reversed(self.bijectors):
-      y = b.forward(y, **condition_kwargs.get(b.name, {}))
+      y = b.forward(y, **kwargs.get(b.name, {}))
     return y
 
-  def _inverse_and_inverse_log_det_jacobian(self, y, **condition_kwargs):
+  def _inverse_and_inverse_log_det_jacobian(self, y, **kwargs):
     x = y
     ildj = constant_op.constant(0., dtype=x.dtype,
                                 name="inverse_log_det_jacobian")
     for b in self.bijectors:
-      x, j = b.inverse_and_inverse_log_det_jacobian(
-          x, **condition_kwargs.get(b.name, {}))
+      x, j = b.inverse_and_inverse_log_det_jacobian(x, **kwargs.get(b.name, {}))
       ildj += j
     return x, ildj
 
-  def _forward_log_det_jacobian(self, x, **condition_kwargs):
+  def _forward_log_det_jacobian(self, x, **kwargs):
     y = x
     fldj = constant_op.constant(0., dtype=x.dtype,
                                 name="forward_log_det_jacobian")
     for b in reversed(self.bijectors):
-      bijector_condition_kwargs = condition_kwargs.get(b.name, {})
-      fldj += b.forward_log_det_jacobian(y, **bijector_condition_kwargs)
-      y = b.forward(y, **bijector_condition_kwargs)
+      bijector_kwargs = kwargs.get(b.name, {})
+      fldj += b.forward_log_det_jacobian(y, **bijector_kwargs)
+      y = b.forward(y, **bijector_kwargs)
     return fldj
 
 
 class Identity(Bijector):
-  """Bijector which computes Y = g(X) = X.
+  """Compute Y = g(X) = X.
 
     Example Use:
 
     ```python
     # Create the Y=g(X)=X transform which is intended for Tensors with 1 batch
     # ndim and 1 event ndim (i.e., vector of vectors).
-    identity = Identity(batch_ndims=1, event_ndims=1)
+    identity = Identity(event_ndims=1)
     x = [[1., 2],
          [3, 4]]
     x == identity.forward(x) == identity.inverse(x)
@@ -1179,9 +1192,10 @@ class Identity(Bijector):
 
   """
 
-  def __init__(self, validate_args=False, name="identity"):
+  def __init__(self, validate_args=False, event_ndims=0, name="identity"):
     super(Identity, self).__init__(
         is_constant_jacobian=True,
+        event_ndims=event_ndims,
         validate_args=validate_args,
         name=name)
 
@@ -1196,7 +1210,7 @@ class Identity(Bijector):
 
 
 class PowerTransform(Bijector):
-  """Bijector which computes `Y = g(X) = (1 + X * c)**(1 / c), X >= -1 / c`.
+  """Compute `Y = g(X) = (1 + X * c)**(1 / c), X >= -1 / c`.
 
   The [power transform](https://en.wikipedia.org/wiki/Power_transform) maps
   inputs from `[0, inf]` to `[-1/c, inf]`; this is equivalent to the `inverse`
@@ -1217,14 +1231,14 @@ class PowerTransform(Bijector):
         `Y = g(X) = (1 + X * c)**(1 / c)` where `c` is the `power`.
       event_ndims: Python scalar indicating the number of dimensions associated
         with a particular draw from the distribution.
-      validate_args: `Boolean` indicating whether arguments should be checked
-        for correctness.
-      name: `String` name given to ops managed by this object.
+      validate_args: Python `bool` indicating whether arguments should be
+        checked for correctness.
+      name: Python `str` name given to ops managed by this object.
 
     Raises:
       ValueError: if `power < 0` or is not known statically.
     """
-    self._parameters = {}
+    self._graph_parents = []
     self._name = name
     self._validate_args = validate_args
     with self._name_scope("init", values=[power]):
@@ -1234,7 +1248,6 @@ class PowerTransform(Bijector):
       raise ValueError("`power` must be a non-negative TF constant.")
     self._power = power
     super(PowerTransform, self).__init__(
-        batch_ndims=0,
         event_ndims=event_ndims,
         validate_args=validate_args,
         name=name)
@@ -1254,31 +1267,27 @@ class PowerTransform(Bijector):
 
   def _inverse_and_inverse_log_det_jacobian(self, y):
     y = self._maybe_assert_valid_y(y)
-    if self.shaper is None:
-      raise ValueError("Jacobian cannot be computed with unknown event_ndims")
-    _, _, event_dims = self.shaper.get_dims(y)
+    event_dims = self._event_dims_tensor(y)
     if self.power == 0.:
       x = math_ops.log(y)
-      ildj = -math_ops.reduce_sum(x, reduction_indices=event_dims)
+      ildj = -math_ops.reduce_sum(x, axis=event_dims)
       return x, ildj
     # TODO(jvdillon): If large y accuracy is an issue, consider using
     # (y**self.power - 1.) / self.power when y >> 1.
-    x = _expm1(math_ops.log(y) * self.power) / self.power
+    x = math_ops.expm1(math_ops.log(y) * self.power) / self.power
     ildj = (self.power - 1.) * math_ops.reduce_sum(
         math_ops.log(y),
-        reduction_indices=event_dims)
+        axis=event_dims)
     return x, ildj
 
   def _forward_log_det_jacobian(self, x):
     x = self._maybe_assert_valid_x(x)
-    if self.shaper is None:
-      raise ValueError("Jacobian cannot be computed with unknown event_ndims")
-    _, _, event_dims = self.shaper.get_dims(x)
+    event_dims = self._event_dims_tensor(x)
     if self.power == 0.:
-      return math_ops.reduce_sum(x, reduction_indices=event_dims)
+      return math_ops.reduce_sum(x, axis=event_dims)
     return (1. / self.power - 1.) * math_ops.reduce_sum(
         math_ops.log1p(x * self.power),
-        reduction_indices=event_dims)
+        axis=event_dims)
 
   def _maybe_assert_valid_x(self, x):
     if not self.validate_args or self.power == 0.:
@@ -1298,14 +1307,14 @@ class PowerTransform(Bijector):
 
 
 class Exp(PowerTransform):
-  """Bijector which computes Y = g(X) = exp(X).
+  """Compute `Y = g(X) = exp(X)`.
 
     Example Use:
 
     ```python
     # Create the Y=g(X)=exp(X) transform which works only on Tensors with 1
     # batch ndim and 2 event ndims (i.e., vector of matrices).
-    exp = Exp(batch_ndims=1, event_ndims=2)
+    exp = Exp(event_ndims=2)
     x = [[[1., 2],
            [3, 4]],
           [[5, 6],
@@ -1327,9 +1336,9 @@ class Exp(PowerTransform):
     Args:
       event_ndims: Scalar `int32` `Tensor` indicating the number of dimensions
         associated with a particular draw from the distribution.
-      validate_args: `Boolean` indicating whether arguments should be checked
-        for correctness.
-      name: `String` name given to ops managed by this object.
+      validate_args: Python `bool` indicating whether arguments should be
+        checked for correctness.
+      name: Python `str` name given to ops managed by this object.
     """
     super(Exp, self).__init__(
         event_ndims=event_ndims,
@@ -1337,205 +1346,728 @@ class Exp(PowerTransform):
         name=name)
 
 
-class ScaleAndShift(Bijector):
-  """Bijector which computes Y = g(X; shift, scale) = matmul(scale, X) + shift.
+# TODO(srvasude): Deprecate this class with a dedicated Linear Operator
+# corresponding to TriL + V D V.T.
+class _TriLPlusVDVTLightweightOperatorPD(object):
+  """Helper/hidden class fake an OperatorPD for TriL+VDV.T."""
 
-  `scale` is either a non-zero scalar, or a lower triangular matrix with
-  non-zero diagonal.  This means the `Bijector` will be invertible and
-  computation of determinant and inverse will be efficient.
+  def __init__(self, tril, v, diag=None, validate_args=False):
+    """Creates an instance of _TriLPlusVDVTLightweightOperatorPD.
 
-  As a result, the mean and covariance are transformed:
+    WARNING: This object is not to be used outside of `Affine` where it is
+    currently being temporarily used for refactoring purposes.
 
-  ```
-  E[Y] = matmul(scale, E[X])
-  Cov[Y] = matmul(scale, matmul(Cov[X], scale, transpose_b=True))
-  ```
+    Args:
+      tril: `Tensor` of shape `[B1,..,Bb, d, d]`.
+      v: `Tensor` of shape `[B1,...,Bb, d, k]`.
+      diag: `Tensor` of shape `[B1,...,Bb, k, k]` or None
+      validate_args: Python `bool` indicating whether arguments should be
+        checked for correctness.
+    """
+    self._m = tril
+    self._v = v
+    self._validate_args = validate_args
+    self._inputs = [tril, v]
+    if diag is not None:
+      self._inputs += [diag]
+      self._d = operator_pd_diag.OperatorPDDiag(diag, verify_pd=validate_args)
+      self._d_inv = operator_pd_diag.OperatorPDDiag(1. / diag,
+                                                    verify_pd=validate_args)
+      return
+    if v.get_shape().is_fully_defined():
+      v_shape = v.get_shape().as_list()
+      id_shape = v_shape[:-2] + [v_shape[-1], v_shape[-1]]
+    else:
+      v_shape = array_ops.shape(v)
+      id_shape = array_ops.concat([v_shape[:-2], [v_shape[-1], v_shape[-1]]], 0)
+    self._d = operator_pd_identity.OperatorPDIdentity(
+        id_shape, v.dtype, verify_pd=self.validate_args)
+    self._d_inv = self._d
 
-  Example Use:
+  @property
+  def inputs(self):
+    return self._inputs
+
+  @property
+  def dtype(self):
+    return self._m.dtype.base_dtype
+
+  @property
+  def validate_args(self):
+    return self._validate_args
+
+  def rank(self):
+    """Returns `rank(self)`."""
+    return array_ops.rank(self._m)
+
+  def sqrt_matmul(self, x):
+    """Computes `matmul(self, x)`.
+
+    Doesn't actually do the sqrt! Named as such to agree with API.
+
+    Args:
+      x: `Tensor`
+
+    Returns:
+      self_times_x: `Tensor`
+    """
+    m_x = math_ops.matmul(self._m, x)
+    vt_x = math_ops.matmul(self._v, x, adjoint_a=True)
+    d_vt_x = self._d.matmul(vt_x)
+    v_d_vt_x = math_ops.matmul(self._v, d_vt_x)
+    return m_x + v_d_vt_x
+
+  def sqrt_solve(self, x):
+    """Computes `solve(self, x)`.
+
+    Doesn't actually do the sqrt! Named as such to agree with API.
+
+    To compute (M + V D V.T), we use the the Woodbury matrix identity:
+      inv(M + V D V.T) = inv(M) - inv(M) V inv(C) V.T inv(M)
+    where,
+      C = inv(D) + V.T inv(M) V.
+    See: https://en.wikipedia.org/wiki/Woodbury_matrix_identity
+
+    Args:
+      x: `Tensor`
+
+    Returns:
+      inv_of_self_times_x: `Tensor`
+    """
+    minv_x = linalg_ops.matrix_triangular_solve(self._m, x)
+    vt_minv_x = math_ops.matmul(self._v, minv_x, transpose_a=True)
+    cinv_vt_minv_x = linalg_ops.matrix_solve(
+        self._woodbury_sandwiched_term(), vt_minv_x)
+    v_cinv_vt_minv_x = math_ops.matmul(self._v, cinv_vt_minv_x)
+    minv_v_cinv_vt_minv_x = linalg_ops.matrix_triangular_solve(
+        self._m, v_cinv_vt_minv_x)
+    return minv_x - minv_v_cinv_vt_minv_x
+
+  def sqrt_log_abs_det(self):
+    """Computes (log o abs o det)(X) for matrix X.
+
+    Doesn't actually do the sqrt! Named as such to agree with API.
+
+    To compute det(M + V D V.T), we use the matrix determinant lemma:
+      det(Tril + V D V.T) = det(C) det(D) det(M)
+    where C is defined as in `_inverse`, ie,
+      C = inv(D) + V.T inv(M) V.
+
+    See: https://en.wikipedia.org/wiki/Matrix_determinant_lemma
+
+    Returns:
+      log_abs_det: `Tensor`.
+    """
+    log_det_c = math_ops.log(math_ops.abs(
+        linalg_ops.matrix_determinant(self._woodbury_sandwiched_term())))
+    # Reduction is ok because we always prepad inputs to this class.
+    log_det_m = math_ops.reduce_sum(math_ops.log(math_ops.abs(
+        array_ops.matrix_diag_part(self._m))), axis=[-1])
+    return log_det_c + 2. * self._d.sqrt_log_abs_det() + log_det_m
+
+  def _woodbury_sandwiched_term(self):
+    """Computes the sandwiched term in the Woodbury identity.
+
+    Computes the "`C`" in the the identity:
+       inv(M + V D V.T) = inv(M) - inv(M) V inv(C) V.T inv(M)
+    where,
+       C = inv(D) + V.T inv(M) V.
+
+    See: https://en.wikipedia.org/wiki/Woodbury_matrix_identity
+
+    Returns:
+      woodbury_sandwich_term: A `Tensor` to be used like `C`, above.
+    """
+    minv_v = linalg_ops.matrix_triangular_solve(self._m, self._v)
+    vt_minv_v = math_ops.matmul(self._v, minv_v, adjoint_a=True)
+    return self._d_inv.add_to_tensor(vt_minv_v)
+
+
+class Affine(Bijector):
+  """Compute `Y = g(X; shift, scale) = scale @ X + shift`.
+
+  Here `scale = c * I + diag(D1) + tril(L) + V @ diag(D2) @ V.T`.
+
+  In TF parlance, the `scale` term is logically equivalent to:
 
   ```python
-  # No batch, scalar
-  mu = 0     # shape=[]
-  sigma = 1  # shape=[], treated like a 1x1 matrix.
-  b = ScaleAndShift(shift=mu, scale=sigma)
-  # b.shaper.batch_ndims == 0
-  # b.shaper.event_ndims == 0
+  scale = (
+    scale_identity_multiplier * tf.diag(tf.ones(d)) +
+    tf.diag(scale_diag) +
+    scale_tril +
+    scale_perturb_factor @ diag(scale_perturb_diag) @
+      tf.transpose([scale_perturb_factor])
+  )
+  ```
 
-  # One batch, scalar.
-  mu = ...    # shape=[b], b>0
-  sigma = ... # shape=[b], b>0, treated like a batch of 1x1 matrices
-  b = ScaleAndShift(shift=mu, scale=sigma)
-  # b.shaper.batch_ndims == 1
-  # b.shaper.event_ndims == 0
+  The `scale` term is applied without necessarily materializing constituent
+  matrices, i.e., the matmul is [matrix-free](
+  https://en.wikipedia.org/wiki/Matrix-free_methods) when possible.
 
-  # No batch, multivariate.
-  mu = ...    # shape=[d],    d>0
-  sigma = ... # shape=[d, d], d>0, treated like a single dxd matrix.
-  b = ScaleAndShift(shift=mu, scale=sigma, event_ndims=1)
-  # b.shaper.batch_ndims == 0
-  # b.shaper.event_ndims == 1
+  Examples:
 
-  # (B1*B2*...*Bb)-batch, multivariate.
-  mu = ...    # shape=[B1,...,Bb, d],    b>0, d>0
-  sigma = ... # shape=[B1,...,Bb, d, d], b>0, d>0
-  b = ScaleAndShift(shift=mu, scale=sigma, event_ndims=1)
-  # b.shaper.batch_ndims == b
-  # b.shaper.event_ndims == 1
+  ```python
+  # Y = X
+  b = Affine()
 
-  # Mu is broadcast:
-  mu = 1
-  sigma = [I, I]  # I is a 3x3 identity matrix.
-  b = ScaleAndShift(shift=mu, scale=sigma, event_ndims=1)
-  x = numpy.ones(S + sigma.shape)
-  b.forward(x) # == x + 1
+  # Y = X + shift
+  b = Affine(shift=[1., 2, 3])
+
+  # Y = 2 * I @ X.T + shift
+  b = Affine(shift=[1., 2, 3],
+             scale_identity_multiplier=2.)
+
+  # Y = tf.diag(d1) @ X.T + shift
+  b = Affine(shift=[1., 2, 3],
+             scale_diag=[-1., 2, 1])         # Implicitly 3x3.
+
+  # Y = (I + v * v.T) @ X.T + shift
+  b = Affine(shift=[1., 2, 3],
+             scale_perturb_factor=[[1., 0],
+                                   [0, 1],
+                                   [1, 1]])
+
+  # Y = (diag(d1) + v * diag(d2) * v.T) @ X.T + shift
+  b = Affine(shift=[1., 2, 3],
+             scale_diag=[1., 3, 3],          # Implicitly 3x3.
+             scale_perturb_diag=[2., 1],     # Implicitly 2x2.
+             scale_perturb_factor=[[1., 0],
+                                   [0, 1],
+                                   [1, 1]])
+
   ```
 
   """
 
   def __init__(self,
-               shift,
-               scale,
-               event_ndims=0,
+               shift=None,
+               scale_identity_multiplier=None,
+               scale_diag=None,
+               scale_tril=None,
+               scale_perturb_factor=None,
+               scale_perturb_diag=None,
+               event_ndims=1,
                validate_args=False,
-               name="scale_and_shift"):
-    """Instantiates the `ScaleAndShift` bijector.
+               name="affine"):
+    """Instantiates the `Affine` bijector.
 
-    This `Bijector` is initialized with `scale` and `shift` `Tensors`, giving
-    the forward operation:
+    This `Bijector` is initialized with `shift` `Tensor` and `scale` arguments,
+    giving the forward operation:
 
-    ```Y = g(X) = matmul(scale, X) + shift```
+    ```none
+    Y = g(X) = scale @ X + shift
+    ```
+
+    where the `scale` term is logically equivalent to:
+
+    ```python
+    scale = (
+      scale_identity_multiplier * tf.diag(tf.ones(d)) +
+      tf.diag(scale_diag) +
+      scale_tril +
+      scale_perturb_factor @ diag(scale_perturb_diag) @
+        tf.transpose([scale_perturb_factor])
+    )
+    ```
+
+    If none of `scale_identity_multiplier`, `scale_diag`, or `scale_tril` are
+    specified then `scale += IdentityMatrix`. Otherwise specifying a
+    `scale` argument has the semantics of `scale += Expand(arg)`, i.e.,
+    `scale_diag != None` means `scale += tf.diag(scale_diag)`.
 
     Args:
-      shift: Numeric `Tensor`.
-      scale: Numeric `Tensor` of same `dtype` as `shift`.  If `event_ndims = 0`,
-        `scale` is treated like a `1x1` matrix or a batch thereof.
-        Otherwise, the last two dimensions of `scale` define a matrix.
-        `scale` must have non-negative diagonal entries.  The upper triangular
-        part of `scale` is ignored, effectively making it lower triangular.
+      shift: Floating-point `Tensor`. If this is set to `None`, no shift is
+        applied.
+      scale_identity_multiplier: floating point rank 0 `Tensor` representing a
+        scaling done to the identity matrix.
+        When `scale_identity_multiplier = scale_diag = scale_tril = None` then
+        `scale += IdentityMatrix`. Otherwise no scaled-identity-matrix is added
+        to `scale`.
+      scale_diag: Floating-point `Tensor` representing the diagonal matrix.
+        `scale_diag` has shape [N1, N2, ...  k], which represents a k x k
+        diagonal matrix.
+        When `None` no diagonal term is added to `scale`.
+      scale_tril: Floating-point `Tensor` representing the diagonal matrix.
+        `scale_diag` has shape [N1, N2, ...  k, k], which represents a k x k
+        lower triangular matrix.
+        When `None` no `scale_tril` term is added to `scale`.
+        The upper triangular elements above the diagonal are ignored.
+      scale_perturb_factor: Floating-point `Tensor` representing factor matrix
+        with last two dimensions of shape `(k, r)`. When `None`, no rank-r
+        update is added to `scale`.
+      scale_perturb_diag: Floating-point `Tensor` representing the diagonal
+        matrix. `scale_perturb_diag` has shape [N1, N2, ...  r], which
+        represents an `r x r` diagonal matrix. When `None` low rank updates will
+        take the form `scale_perturb_factor * scale_perturb_factor.T`.
       event_ndims: Scalar `int32` `Tensor` indicating the number of dimensions
-        associated with a particular draw from the distribution.  Must be 0 or 1
-      validate_args: `Boolean` indicating whether arguments should be checked
-        for correctness.
-      name: `String` name given to ops managed by this object.
-    """
+        associated with a particular draw from the distribution. Must be 0 or 1.
+      validate_args: Python `bool` indicating whether arguments should be
+        checked for correctness.
+      name: Python `str` name given to ops managed by this object.
 
-    self._parameters = {}
+    Raises:
+      ValueError: if `perturb_diag` is specified but not `perturb_factor`.
+      TypeError: if `shift` has different `dtype` from `scale` arguments.
+    """
+    self._graph_parents = []
     self._name = name
     self._validate_args = validate_args
-    with self._name_scope("init", values=[shift, scale, event_ndims]):
-      self._shift = ops.convert_to_tensor(shift, name="shift")
-      self._scale = ops.convert_to_tensor(scale, name="scale")
+    # Ambiguous definition of low rank update.
+    if scale_perturb_diag is not None and scale_perturb_factor is None:
+      raise ValueError("When scale_perturb_diag is specified, "
+                       "scale_perturb_factor must be specified.")
+    # Special case, only handling a scaled identity matrix. We don't know its
+    # dimensions, so this is special cased.
+    # We don't check identity_multiplier, since below we set it to 1. if all
+    # other scale args are None.
+    self._is_only_identity_multiplier = (scale_tril is None and
+                                         scale_diag is None and
+                                         scale_perturb_factor is None)
+    # When no args are specified, pretend the scale matrix is the identity
+    # matrix.
+    if self._is_only_identity_multiplier and scale_identity_multiplier is None:
+      scale_identity_multiplier = 1.
+    with self._name_scope("init", values=[
+        shift, scale_identity_multiplier, scale_diag, scale_tril,
+        scale_perturb_diag, scale_perturb_factor, event_ndims]):
       event_ndims = ops.convert_to_tensor(event_ndims, name="event_ndims")
       if validate_args:
+        is_less_than_two = check_ops.assert_less(
+            event_ndims, 2,
+            message="event_ndims must be 0 or 1")
         event_ndims = control_flow_ops.with_dependencies(
-            [check_ops.assert_less(
-                event_ndims, 2, message="event_ndims must be 0 or 1")],
-            event_ndims)
-      if self.shift.dtype.base_dtype != self.scale.dtype.base_dtype:
-        raise TypeError("%s.dtype=%s does not match %s.dtype=%s" %
-                        (self.shift.name, self.shift.dtype, self.scale.name,
-                         self.scale.dtype))
-      if event_ndims.dtype.base_dtype != dtypes.int32.base_dtype:
-        raise TypeError("%s.dtype=%s does not match %s" %
-                        (event_ndims.name, event_ndims.dtype, dtypes.int32))
-      self._scale, batch_ndims = self._process_scale(self.scale, event_ndims)
-      super(ScaleAndShift, self).__init__(
-          batch_ndims=batch_ndims,
+            [is_less_than_two], event_ndims)
+      self._shift = _as_tensor(shift, "shift")
+      # self._create_scale_operator returns an OperatorPD in all cases except if
+      # self._is_only_identity_multiplier; in which case it returns a scalar
+      # Tensor.
+      self._scale = self._create_scale_operator(
+          identity_multiplier=scale_identity_multiplier,
+          diag=scale_diag,
+          tril=scale_tril,
+          perturb_diag=scale_perturb_diag,
+          perturb_factor=scale_perturb_factor,
           event_ndims=event_ndims,
-          parameters={"shift": self.shift, "scale": self.scale},
+          validate_args=validate_args)
+      if (self._shift is not None and
+          self._shift.dtype.base_dtype != self._scale.dtype.base_dtype):
+        raise TypeError("shift.dtype({}) does not match scale.dtype({})".format(
+            self._shift.dtype, self._scale.dtype))
+      self._shaper = _DistributionShape(
+          batch_ndims=self._infer_batch_ndims(),
+          event_ndims=event_ndims,
+          validate_args=validate_args)
+      super(Affine, self).__init__(
+          event_ndims=event_ndims,
+          graph_parents=(
+              [event_ndims] +
+              [self._scale] if contrib_framework.is_tensor(self._scale)
+              else self._scale.inputs +
+              [self._shift] if self._shift is not None else []),
           is_constant_jacobian=True,
+          dtype=self._scale.dtype,
           validate_args=validate_args,
           name=name)
 
-  def _process_scale(self, scale, event_ndims):
-    """Helper to __init__ which gets scale in batch-ready form.
-
-    This function expands dimensions of `scale` according to the following
-    table:
-                     event_ndims
-    scale.ndims   0            1
-              0  [1]+S+[1,1]   "silent error"
-              1  [ ]+S+[1,1]   "silent error"
-              2  [ ]+S+[1,1]   [1]+S+[ ]
-              3  [ ]+S+[1,1]   [ ]+S+[ ]
-            ...  (same)        (same)
-
-    The idea is that we want to convert `scale` into something which can always
-    work for, say, the left-hand argument of `batch_matmul`.
+  def _create_scale_operator(self, identity_multiplier, diag, tril,
+                             perturb_diag, perturb_factor, event_ndims,
+                             validate_args):
+    """Construct `scale` from various components.
 
     Args:
-      scale: `Tensor`.
-      event_ndims: `Tensor` (0D, `int32`).
+      identity_multiplier: floating point rank 0 `Tensor` representing a scaling
+        done to the identity matrix.
+      diag: Floating-point `Tensor` representing the diagonal matrix.
+        `scale_diag` has shape [N1, N2, ...  k], which represents a k x k
+        diagonal matrix.
+      tril: Floating-point `Tensor` representing the diagonal matrix.
+        `scale_tril` has shape [N1, N2, ...  k], which represents a k x k lower
+        triangular matrix.
+      perturb_diag: Floating-point `Tensor` representing the diagonal matrix of
+        the low rank update.
+      perturb_factor: Floating-point `Tensor` representing factor matrix.
+      event_ndims: Scalar `int32` `Tensor` indicating the number of dimensions
+        associated with a particular draw from the distribution. Must be 0 or 1
+      validate_args: Python `bool` indicating whether arguments should be
+        checked for correctness.
 
     Returns:
-      scale: `Tensor` with dims expanded according to [above] table.
-      batch_ndims: `Tensor` (0D, `int32`).  The ndims of the `batch` portion.
+      scale. In the case of scaling by a constant, scale is a
+      floating point `Tensor`. Otherwise, scale is an `OperatorPD`.
+
+    Raises:
+      ValueError: if all of `tril`, `diag` and `identity_multiplier` are `None`.
     """
-    ndims = array_ops.rank(scale)
-    left = array_ops.where(
-        math_ops.reduce_any([
-            math_ops.reduce_all([
-                math_ops.equal(ndims, 0),
-                math_ops.equal(event_ndims, 0)
-            ]),
-            math_ops.reduce_all([
-                math_ops.equal(ndims, 2),
-                math_ops.equal(event_ndims, 1)
-            ])]), 1, 0)
-    right = array_ops.where(math_ops.equal(event_ndims, 0), 2, 0)
-    pad = array_ops.concat(0, (
-        array_ops.ones([left], dtype=dtypes.int32),
-        array_ops.shape(scale),
-        array_ops.ones([right], dtype=dtypes.int32)))
-    scale = array_ops.reshape(scale, pad)
-    batch_ndims = ndims - 2 + right
-    # For safety, explicitly zero-out the upper triangular part.
-    scale = array_ops.matrix_band_part(scale, -1, 0)
-    if self.validate_args:
-      # matrix_band_part will fail if scale is not at least rank 2.
-      shape = array_ops.shape(scale)
-      assert_square = check_ops.assert_equal(
-          shape[-2], shape[-1],
-          message="Input must be a (batch of) square matrix.")
-      # Assuming lower-triangular means we only need check diag != 0.
-      diag = array_ops.matrix_diag_part(scale)
-      is_non_singular = math_ops.logical_not(
-          math_ops.reduce_any(
-              math_ops.equal(diag, ops.convert_to_tensor(0, dtype=diag.dtype))))
-      assert_non_singular = control_flow_ops.Assert(
-          is_non_singular, ["Singular matrix encountered", diag])
-      scale = control_flow_ops.with_dependencies(
-          [assert_square, assert_non_singular], scale)
-    return scale, batch_ndims
+    identity_multiplier = _as_tensor(identity_multiplier, "identity_multiplier")
+    diag = _as_tensor(diag, "diag")
+    tril = _as_tensor(tril, "tril")
+    perturb_diag = _as_tensor(perturb_diag, "perturb_diag")
+    perturb_factor = _as_tensor(perturb_factor, "perturb_factor")
+
+    identity_multiplier = self._maybe_validate_identity_multiplier(
+        identity_multiplier, validate_args)
+
+    if perturb_factor is not None:
+      perturb_factor = self._process_matrix(
+          perturb_factor, min_rank=2, event_ndims=event_ndims)
+
+    if perturb_diag is not None:
+      perturb_diag = self._process_matrix(
+          perturb_diag, min_rank=1, event_ndims=event_ndims)
+
+    # The following if-statments are ordered by increasingly stronger
+    # assumptions in the base matrix, i.e., we process in the order:
+    # TriL, Diag, Identity.
+
+    if tril is not None:
+      tril = self._preprocess_tril(
+          identity_multiplier, diag, tril, event_ndims)
+      if perturb_factor is None:
+        return operator_pd_cholesky.OperatorPDCholesky(
+            tril, verify_pd=validate_args)
+      return _TriLPlusVDVTLightweightOperatorPD(
+          tril=tril, v=perturb_factor, diag=perturb_diag,
+          validate_args=validate_args)
+
+    if diag is not None:
+      diag = self._preprocess_diag(identity_multiplier, diag, event_ndims)
+      if perturb_factor is None:
+        return operator_pd_diag.OperatorPDSqrtDiag(
+            diag, verify_pd=validate_args)
+      return operator_pd_vdvt_update.OperatorPDSqrtVDVTUpdate(
+          operator=operator_pd_diag.OperatorPDDiag(
+              diag, verify_pd=validate_args),
+          v=perturb_factor,
+          diag=perturb_diag,
+          verify_pd=validate_args)
+
+    if identity_multiplier is not None:
+      if perturb_factor is None:
+        return identity_multiplier
+      # Infer the shape from the V and D.
+      v_shape = array_ops.shape(perturb_factor)
+      identity_shape = array_ops.concat([v_shape[:-1], [v_shape[-2]]], 0)
+      scaled_identity = operator_pd_identity.OperatorPDIdentity(
+          identity_shape,
+          perturb_factor.dtype.base_dtype,
+          scale=identity_multiplier,
+          verify_pd=validate_args)
+      return operator_pd_vdvt_update.OperatorPDSqrtVDVTUpdate(
+          operator=scaled_identity,
+          v=perturb_factor,
+          diag=perturb_diag,
+          verify_pd=validate_args)
+
+    raise ValueError("One of tril, diag and/or identity_multiplier must be "
+                     "specified.")
+
+  def _maybe_validate_identity_multiplier(self, identity_multiplier,
+                                          validate_args):
+    """Check that the init arg `identity_multiplier` is valid."""
+    if identity_multiplier is None or not validate_args:
+      return identity_multiplier
+    if validate_args:
+      identity_multiplier = control_flow_ops.with_dependencies(
+          [check_ops.assert_positive(identity_multiplier)],
+          identity_multiplier)
+    return identity_multiplier
+
+  def _preprocess_tril(self, identity_multiplier, diag, tril, event_ndims):
+    """Helper to preprocess a lower triangular matrix."""
+    tril = array_ops.matrix_band_part(tril, -1, 0)  # Zero out TriU.
+    if identity_multiplier is None and diag is None:
+      return self._process_matrix(tril, min_rank=2, event_ndims=event_ndims)
+    new_diag = array_ops.matrix_diag_part(tril)
+    if identity_multiplier is not None:
+      new_diag += identity_multiplier
+    if diag is not None:
+      new_diag += diag
+    tril = array_ops.matrix_set_diag(tril, new_diag)
+    return self._process_matrix(tril, min_rank=2, event_ndims=event_ndims)
+
+  def _preprocess_diag(self, identity_multiplier, diag, event_ndims):
+    """Helper to preprocess a diagonal matrix."""
+    if identity_multiplier is not None:
+      diag += identity_multiplier
+    return self._process_matrix(diag, min_rank=1, event_ndims=event_ndims)
+
+  def _process_matrix(self, matrix, min_rank, event_ndims):
+    """Helper to __init__ which gets matrix in batch-ready form."""
+    # Pad the matrix so that matmul works in the case of a matrix and vector
+    # input. Keep track if the matrix was padded, to distinguish between a
+    # rank 3 tensor and a padded rank 2 tensor.
+    # TODO(srvasude): Remove side-effects from functions. Its currently unbroken
+    # but error-prone since the function call order may change in the future.
+    self._rank_two_event_ndims_one = math_ops.logical_and(
+        math_ops.equal(array_ops.rank(matrix), min_rank),
+        math_ops.equal(event_ndims, 1))
+    left = array_ops.where(self._rank_two_event_ndims_one, 1, 0)
+    pad = array_ops.concat(
+        [array_ops.ones(
+            [left], dtype=dtypes.int32), array_ops.shape(matrix)],
+        0)
+    return array_ops.reshape(matrix, pad)
+
+  def _infer_batch_ndims(self):
+    """Return batch_ndims."""
+    if self._is_only_identity_multiplier:
+      return 0
+    # The real batch dims is one less when we pad in the case of event_ndims =
+    # 1, and the rank of the underlying scale being 2. This allows us to have
+    # non-negative sample dims.
+    return (self._scale.rank() - 2 -
+            array_ops.where(self._rank_two_event_ndims_one, 1, 0))
 
   @property
   def shift(self):
+    """The `shift` `Tensor` in `Y = scale @ X + shift`."""
     return self._shift
 
   @property
   def scale(self):
+    """The `scale` `LinearOperator` in `Y = scale @ X + shift`."""
+    # TODO(srvasude): Remove this exception once TriLPlusVDVT is properly
+    # implemented.
+    if isinstance(self._scale, _TriLPlusVDVTLightweightOperatorPD):
+      raise NotImplementedError("Cannot access scale when Tril+VDV.T.")
     return self._scale
 
   def _forward(self, x):
-    x, sample_shape = self.shaper.make_batch_of_event_sample_matrices(x)
-    x = math_ops.matmul(self.scale, x)
-    x = self.shaper.undo_make_batch_of_event_sample_matrices(x, sample_shape)
-    x += self.shift
-    return x
+    y = x
+    if self._is_only_identity_multiplier:
+      y *= self._scale
+      if self.shift is not None:
+        return y + self.shift
+      return  y
+    y, sample_shape = self._shaper.make_batch_of_event_sample_matrices(y)
+    y = self._scale.sqrt_matmul(y)
+    y = self._shaper.undo_make_batch_of_event_sample_matrices(y, sample_shape)
+    if self.shift is not None:
+      return y + self.shift
+    return y
 
   def _inverse(self, y):
-    x = y - self.shift
-    x, sample_shape = self.shaper.make_batch_of_event_sample_matrices(x)
-    x = linalg_ops.matrix_triangular_solve(self.scale, x)
-    x = self.shaper.undo_make_batch_of_event_sample_matrices(x, sample_shape)
+    x = y
+    if self.shift is not None:
+      x -= self.shift
+    if self._is_only_identity_multiplier:
+      return x / self._scale
+    x, sample_shape = self._shaper.make_batch_of_event_sample_matrices(x)
+    x = self._scale.sqrt_solve(x)
+    x = self._shaper.undo_make_batch_of_event_sample_matrices(x, sample_shape)
     return x
 
-  def _inverse_log_det_jacobian(self, y):  # pylint: disable=unused-argument
-    abs_diag = math_ops.abs(array_ops.matrix_diag_part(self.scale))
-    return -math_ops.reduce_sum(math_ops.log(abs_diag), reduction_indices=[-1])
+  def _inverse_log_det_jacobian(self, y):
+    return -self._forward_log_det_jacobian(y)
+
+  def _forward_log_det_jacobian(self, x):
+    if self._is_only_identity_multiplier:
+      # TODO(jvdillon): We don't pad in this case and instead let the fldj be
+      # applied via broadcast.
+      d = math_ops.cast(array_ops.shape(x)[-1], dtype=self._scale.dtype)
+      return math_ops.log(math_ops.abs(self._scale)) * array_ops.where(
+          math_ops.equal(self._shaper.event_ndims, 0), 1., d)
+    fldj = self._scale.sqrt_log_abs_det()
+    # We need to squeeze off the padded dimension.
+    start = array_ops.where(self._rank_two_event_ndims_one, 1, 0)
+    return array_ops.reshape(fldj, array_ops.shape(fldj)[start:])
+
+
+class AffineLinearOperator(Bijector):
+  """Compute `Y = g(X; shift, scale) = scale @ X + shift`.
+
+  `shift` is a numeric `Tensor` and `scale` is a `LinearOperator`.
+
+  If `X` is a scalar then the forward transformation is: `scale * X + shift`
+  where `*` denotes the scalar product.
+
+  Note: we don't always simply transpose `X` (but write it this way for
+  brevity). Actually the input `X` undergoes the following transformation
+  before being premultiplied by `scale`:
+
+  1. If there are no sample dims, we call `X = tf.expand_dims(X, 0)`, i.e.,
+     `new_sample_shape = [1]`. Otherwise do nothing.
+  2. The sample shape is flattened to have one dimension, i.e.,
+     `new_sample_shape = [n]` where `n = tf.reduce_prod(old_sample_shape)`.
+  3. The sample dim is cyclically rotated left by 1, i.e.,
+     `new_shape = [B1,...,Bb, k, n]` where `n` is as above, `k` is the
+     event_shape, and `B1,...,Bb` are the batch shapes for each of `b` batch
+     dimensions.
+
+  (For more details see `shape.make_batch_of_event_sample_matrices`.)
+
+  The result of the above transformation is that `X` can be regarded as a batch
+  of matrices where each column is a draw from the distribution. After
+  premultiplying by `scale`, we take the inverse of this procedure. The input
+  `Y` also undergoes the same transformation before/after premultiplying by
+  `inv(scale)`.
+
+  Example Use:
+
+  ```python
+  linalg = tf.contrib.linalg
+
+  x = [1., 2, 3]
+
+  shift = [-1., 0., 1]
+  diag = [1., 2, 3]
+  scale = linalg.LinearOperatorDiag(diag)
+  affine = AffineLinearOperator(shift, scale)
+  # In this case, `forward` is equivalent to:
+  # y = scale @ x + shift
+  y = affine.forward(x)  # [0., 4, 10]
+
+  shift = [2., 3, 1]
+  tril = [[1., 0, 0],
+          [2, 1, 0],
+          [3, 2, 1]]
+  scale = linalg.LinearOperatorTriL(tril)
+  affine = AffineLinearOperator(shift, scale)
+  # In this case, `forward` is equivalent to:
+  # np.squeeze(np.matmul(tril, np.expand_dims(x, -1)), -1) + shift
+  y = affine.forward(x)  # [3., 7, 11]
+  ```
+
+  """
+
+  def __init__(self,
+               shift=None,
+               scale=None,
+               event_ndims=1,
+               validate_args=False,
+               name="affine_linear_operator"):
+    """Instantiates the `AffineLinearOperator` bijector.
+
+    Args:
+      shift: Floating-point `Tensor`.
+      scale:  Subclass of `LinearOperator`. Represents the (batch) positive
+        definite matrix `M` in `R^{k x k}`.
+      event_ndims: Scalar `integer` `Tensor` indicating the number of dimensions
+        associated with a particular draw from the distribution. Must be 0 or 1.
+      validate_args: Python `bool` indicating whether arguments should be
+        checked for correctness.
+      name: Python `str` name given to ops managed by this object.
+
+    Raises:
+      ValueError: if `event_ndims` is not 0 or 1.
+      TypeError: if `scale` is not a `LinearOperator`.
+      TypeError: if `shift.dtype` does not match `scale.dtype`.
+      ValueError: if not `scale.is_non_singular`.
+    """
+    self._graph_parents = []
+    self._name = name
+    self._validate_args = validate_args
+    graph_parents = []
+    with self._name_scope("init", values=[shift]):
+      event_ndims = ops.convert_to_tensor(event_ndims, name="event_ndims")
+      if tensor_util.constant_value(event_ndims) is not None:
+        event_ndims = tensor_util.constant_value(event_ndims)
+        if event_ndims not in (0, 1):
+          raise ValueError("event_ndims({}) was not 0 or 1".format(event_ndims))
+      else:
+        if validate_args:
+          # Shape tool will catch if event_ndims is negative.
+          event_ndims = control_flow_ops.with_dependencies(
+              [check_ops.assert_less(
+                  event_ndims, 2, message="event_ndims must be 0 or 1")],
+              event_ndims)
+        graph_parents += [event_ndims]
+
+      # In the absence of `loc` and `scale`, we'll assume `dtype` is `float32`.
+      dtype = dtypes.float32
+
+      if shift is not None:
+        shift = ops.convert_to_tensor(shift, name="shift")
+        graph_parents += [shift]
+        dtype = shift.dtype.base_dtype
+      self._shift = shift
+
+      if scale is not None:
+        if (shift is not None and
+            shift.dtype.base_dtype != scale.dtype.base_dtype):
+          raise TypeError(
+              "shift.dtype({}) is incompatible with scale.dtype({}).".format(
+                  shift.dtype, scale.dtype))
+        if not isinstance(scale, linear_operator.LinearOperator):
+          raise TypeError("scale is not an instance of tf.LinearOperator")
+        if validate_args and not scale.is_non_singular:
+          raise ValueError("Scale matrix must be non-singular.")
+        graph_parents += scale.graph_parents
+        if scale.tensor_rank is not None:
+          batch_ndims = scale.tensor_rank - 2
+        else:
+          batch_ndims = scale.tensor_rank_tensor() - 2
+          graph_parents += [batch_ndims]
+        if scale.dtype is not None:
+          dtype = scale.dtype.base_dtype
+      else:
+        batch_ndims = 0  # We won't need shape inference when scale is None.
+      self._scale = scale
+      self._shaper = _DistributionShape(
+          batch_ndims=batch_ndims,
+          event_ndims=event_ndims,
+          validate_args=validate_args)
+      super(AffineLinearOperator, self).__init__(
+          event_ndims=event_ndims,
+          graph_parents=graph_parents,
+          is_constant_jacobian=True,
+          dtype=dtype,
+          validate_args=validate_args,
+          name=name)
+
+  @property
+  def shift(self):
+    """The `shift` `Tensor` in `Y = scale @ X + shift`."""
+    return self._shift
+
+  @property
+  def scale(self):
+    """The `scale` `LinearOperator` in `Y = scale @ X + shift`."""
+    return self._scale
+
+  def _forward(self, x):
+    y = x
+    if self.scale is not None:
+      y, sample_shape = self._shaper.make_batch_of_event_sample_matrices(
+          y, expand_batch_dim=False)
+      with ops.control_dependencies(self._maybe_collect_assertions() if
+                                    self.validate_args else []):
+        y = self.scale.apply(y)
+      y = self._shaper.undo_make_batch_of_event_sample_matrices(
+          y, sample_shape, expand_batch_dim=False)
+    if self.shift is not None:
+      y += self.shift
+    return y
+
+  def _inverse(self, y):
+    x = y
+    if self.shift is not None:
+      x -= self.shift
+    if self.scale is not None:
+      x, sample_shape = self._shaper.make_batch_of_event_sample_matrices(
+          x, expand_batch_dim=False)
+      # Solve fails if the op is singular so we may safely skip this assertion.
+      x = self.scale.solve(x)
+      x = self._shaper.undo_make_batch_of_event_sample_matrices(
+          x, sample_shape, expand_batch_dim=False)
+    return x
+
+  def _inverse_log_det_jacobian(self, y):
+    return -self._forward_log_det_jacobian(y)
 
   def _forward_log_det_jacobian(self, x):  # pylint: disable=unused-argument
-    return -self._inverse_log_det_jacobian(x)
+    if self.scale is None:
+      return constant_op.constant(0, dtype=x.dtype.base_dtype)
+    with ops.control_dependencies(self._maybe_collect_assertions() if
+                                  self.validate_args else []):
+      return self.scale.log_abs_determinant()
+
+  def _maybe_collect_assertions(self):
+    try:
+      return [self.scale.assert_non_singular()]
+    except NotImplementedError:
+      pass
+    return []
 
 
 class Softplus(Bijector):
@@ -1552,7 +2084,7 @@ class Softplus(Bijector):
     ```python
     # Create the Y=g(X)=softplus(X) transform which works only on Tensors with 1
     # batch ndim and 2 event ndims (i.e., vector of matrices).
-    softplus = Softplus(batch_ndims=1, event_ndims=2)
+    softplus = Softplus(event_ndims=2)
     x = [[[1., 2],
            [3, 4]],
           [[5, 6],
@@ -1570,7 +2102,6 @@ class Softplus(Bijector):
                validate_args=False,
                name="softplus"):
     super(Softplus, self).__init__(
-        batch_ndims=0,
         event_ndims=event_ndims,
         validate_args=validate_args,
         name=name)
@@ -1579,38 +2110,24 @@ class Softplus(Bijector):
     return nn_ops.softplus(x)
 
   def _inverse_and_inverse_log_det_jacobian(self, y):
-    # The most stable inverse of softplus is not the most obvious one.
-    # y = softplus(x) = Log[1 + exp{x}], (which means y > 0).
-    # ==> exp{y} = 1 + exp{x}                                (1)
-    # ==> x = Log[exp{y} - 1]                                (2)
-    #       = Log[(exp{y} - 1) / exp{y}] + Log[exp{y}]
-    #       = Log[(1 - exp{-y}) / 1] + Log[exp{y}]
-    #       = Log[1 - exp{-y}] + y                           (3)
-    # (2) is the "obvious" inverse, but (3) is more stable than (2) for large y.
-    # For small y (e.g. y = 1e-10), (3) will become -inf since 1 - exp{-y} will
-    # be zero.  To fix this, we use 1 - exp{-y} approx y for small y > 0.
-    #
-    # Stable inverse log det jacobian.
+    event_dims = self._event_dims_tensor(y)
+    # Could also do:
+    #   ildj = math_ops.reduce_sum(y - distribution_util.softplus_inverse(y),
+    #                              axis=event_dims)
+    # but the following is more numerically stable. Ie,
     # Y = Log[1 + exp{X}] ==> X = Log[exp{Y} - 1]
     # ==> dX/dY = exp{Y} / (exp{Y} - 1)
     #           = 1 / (1 - exp{-Y}),
-    # which is the most stable for large Y > 0.  For small Y, we use
+    # which is the most stable for large Y > 0. For small Y, we use
     # 1 - exp{-Y} approx Y.
-    if self.shaper is None:
-      raise ValueError("Jacobian cannot be computed with unknown event_ndims")
-    _, _, event_dims = self.shaper.get_dims(y)
-    log_one_minus_exp_neg = math_ops.log(-_expm1(-y))
-    x = y + log_one_minus_exp_neg
-    ildj = -math_ops.reduce_sum(
-        log_one_minus_exp_neg, reduction_indices=event_dims)
-    return x, ildj
+    ildj = -math_ops.reduce_sum(math_ops.log(-math_ops.expm1(-y)),
+                                axis=event_dims)
+    return distribution_util.softplus_inverse(y), ildj
 
   def _forward_log_det_jacobian(self, x):  # pylint: disable=unused-argument
-    if self.shaper is None:
-      raise ValueError("Jacobian cannot be computed with unknown event_ndims")
-    _, _, event_dims = self.shaper.get_dims(x)
+    event_dims = self._event_dims_tensor(x)
     return -math_ops.reduce_sum(
-        nn_ops.softplus(-x), reduction_indices=event_dims)
+        nn_ops.softplus(-x), axis=event_dims)
 
 
 class SoftmaxCentered(Bijector):
@@ -1618,7 +2135,7 @@ class SoftmaxCentered(Bijector):
 
   To implement [softmax](https://en.wikipedia.org/wiki/Softmax_function) as a
   bijection, the forward transformation appends a value to the input and the
-  inverse removes this coordinate.  The appended coordinate represents a pivot,
+  inverse removes this coordinate. The appended coordinate represents a pivot,
   e.g., `softmax(x) = exp(x-c) / sum(exp(x-c))` where `c` is the implicit last
   coordinate.
 
@@ -1639,7 +2156,7 @@ class SoftmaxCentered(Bijector):
 
   At first blush it may seem like the [Invariance of domain](
   https://en.wikipedia.org/wiki/Invariance_of_domain) theorem implies this
-  implementation is not a bijection.  However, the appended dimension
+  implementation is not a bijection. However, the appended dimension
   makes the (forward) image non-open and the theorem does not directly apply.
   """
 
@@ -1647,7 +2164,7 @@ class SoftmaxCentered(Bijector):
                event_ndims=0,
                validate_args=False,
                name="softmax_centered"):
-    self._parameters = {}
+    self._graph_parents = []
     self._name = name
     with self._name_scope("init", values=[event_ndims]):
       event_ndims = ops.convert_to_tensor(event_ndims, name="event_ndims")
@@ -1656,12 +2173,11 @@ class SoftmaxCentered(Bijector):
         raise ValueError("`event_ndims` must be a TF constant which is 0 or 1")
     self._static_event_ndims = event_ndims
     super(SoftmaxCentered, self).__init__(
-        batch_ndims=0,  # We'll regard all non-event dims as sample dims.
         event_ndims=event_ndims,
         validate_args=validate_args,
         name=name)
 
-  def _get_forward_event_shape(self, input_shape):
+  def _forward_event_shape(self, input_shape):
     if input_shape.ndims is None:
       return input_shape
     if input_shape.ndims != self._static_event_ndims:
@@ -1674,7 +2190,7 @@ class SoftmaxCentered(Bijector):
     # Unreachable code:
     raise ValueError("event_ndims = %d must be 0 or 1" % input_shape.ndims)
 
-  def _forward_event_shape(self, input_shape):
+  def _forward_event_shape_tensor(self, input_shape):
     ndims = array_ops.shape(input_shape)
     if self.validate_args:
       # It is not possible for a negative shape so we need only check <= 1.
@@ -1687,7 +2203,7 @@ class SoftmaxCentered(Bijector):
           [2], dtype=dtypes.int32, name="output_shape")
     return input_shape + 1
 
-  def _get_inverse_event_shape(self, output_shape):
+  def _inverse_event_shape(self, output_shape):
     if output_shape.ndims is None:
       return output_shape
     if output_shape.ndims != 1:
@@ -1696,7 +2212,7 @@ class SoftmaxCentered(Bijector):
       return tensor_shape.TensorShape([])
     return tensor_shape.TensorShape(output_shape[0] - 1)
 
-  def _inverse_event_shape(self, output_shape):
+  def _inverse_event_shape_tensor(self, output_shape):
     ndims = array_ops.shape(output_shape)[0]
     if self.validate_args:
       # It is not possible for a negative shape so we need only check <= 1.
@@ -1713,9 +2229,11 @@ class SoftmaxCentered(Bijector):
     y = array_ops.expand_dims(x, dim=-1) if self._static_event_ndims == 0 else x
     ndims = (y.get_shape().ndims if y.get_shape().ndims is not None
              else array_ops.rank(y))
-    y = array_ops.pad(y, paddings=array_ops.concat(0, (
-        array_ops.zeros((ndims - 1, 2), dtype=dtypes.int32),
-        [[0, 1]])))
+    y = array_ops.pad(y,
+                      paddings=array_ops.concat(
+                          (array_ops.zeros(
+                              (ndims - 1, 2), dtype=dtypes.int32), [[0, 1]]),
+                          0))
 
     # Set shape hints.
     if x.get_shape().ndims is not None:
@@ -1756,12 +2274,12 @@ class SoftmaxCentered(Bijector):
                               depth=ndims,
                               on_value=shape[-1]-np.array(1, dtype=shape.dtype),
                               dtype=shape.dtype)
-    size = array_ops.concat(0, (shape[:-1], np.asarray([1], dtype=shape.dtype)))
+    size = array_ops.concat([shape[:-1], np.asarray([1], dtype=shape.dtype)], 0)
     log_normalization = -array_ops.strided_slice(x, begin, begin + size)
 
     # Here we slice out all but the last coordinate; see above for idea.
     begin = array_ops.zeros_like(shape)
-    size = array_ops.concat(0, (shape[:-1], [shape[-1]-1]))
+    size = array_ops.concat([shape[:-1], [shape[-1] - 1]], 0)
     x = array_ops.strided_slice(x, begin, begin + size)
 
     x += log_normalization
@@ -1799,7 +2317,7 @@ class SoftmaxCentered(Bijector):
     #       or by noting that det{ dX/dY } = 1 / det{ dY/dX } from Bijector
     #       docstring "Tip".
     # (2) - https://en.wikipedia.org/wiki/Matrix_determinant_lemma
-    return -math_ops.reduce_sum(math_ops.log(y), reduction_indices=-1)
+    return -math_ops.reduce_sum(math_ops.log(y), axis=-1)
 
   def _forward_log_det_jacobian(self, x):
     if self._static_event_ndims == 0:
@@ -1812,10 +2330,10 @@ class SoftmaxCentered(Bijector):
       #   log_normalization = 1 + reduce_sum(exp(logits))
       #   -log_normalization + reduce_sum(logits - log_normalization)
       log_normalization = nn_ops.softplus(
-          math_ops.reduce_logsumexp(x, reduction_indices=-1, keep_dims=True))
+          math_ops.reduce_logsumexp(x, axis=-1, keep_dims=True))
       fldj = (-log_normalization +
               math_ops.reduce_sum(x - log_normalization,
-                                  reduction_indices=-1,
+                                  axis=-1,
                                   keep_dims=True))
       return array_ops.squeeze(fldj, squeeze_dims=-1)
 
@@ -1830,12 +2348,11 @@ class SigmoidCentered(SoftmaxCentered):
 
   def __init__(self, validate_args=False, name="sigmoid_centered"):
     super(SigmoidCentered, self).__init__(
-        validate_args=validate_args, name=name)
+        event_ndims=0, validate_args=validate_args, name=name)
 
 
 class CholeskyOuterProduct(Bijector):
-  # pylint: disable=line-too-long
-  """Bijector which computes Y = g(X) = X X^T where X is a lower-triangular, positive-diagonal matrix.
+  """Compute `g(X) = X @ X.T`; X is lower-triangular, positive-diagonal matrix.
 
   `event_ndims` must be 0 or 2, i.e., scalar or matrix.
 
@@ -1845,14 +2362,13 @@ class CholeskyOuterProduct(Bijector):
 
   ```python
   bijector.CholeskyOuterProduct(event_ndims=2).forward(x=[[1., 0], [2, 1]])
-  # Result: [[1, 1], [1, 5]], i.e., x x^T
+  # Result: [[1., 2], [2, 5]], i.e., x @ x.T
 
-  bijector.SoftmaxCentered(event_ndims=2).inverse(y=[[1., 1], [1, 5]])
-  # Result: [[1, 0], [2, 1]], i.e., chol(y).
+  bijector.CholeskyOuterProduct(event_ndims=2).inverse(y=[[1., 2], [2, 5]])
+  # Result: [[1., 0], [2, 1]], i.e., cholesky(y).
   ```
 
   """
-  # pylint: enable=line-too-long
 
   def __init__(self, event_ndims=2, validate_args=False,
                name="cholesky_outer_product"):
@@ -1862,14 +2378,14 @@ class CholeskyOuterProduct(Bijector):
       event_ndims: `constant` `int32` scalar `Tensor` indicating the number of
         dimensions associated with a particular draw from the distribution. Must
         be 0 or 2.
-      validate_args: `Boolean` indicating whether arguments should be checked
-        for correctness.
-      name: `String` name given to ops managed by this object.
+      validate_args: Python `bool` indicating whether arguments should be
+        checked for correctness.
+      name: Python `str` name given to ops managed by this object.
 
     Raises:
       ValueError: if event_ndims is neither 0 or 2.
     """
-    self._parameters = {}
+    self._graph_parents = []
     self._name = name
     with self._name_scope("init", values=[event_ndims]):
       event_ndims = ops.convert_to_tensor(event_ndims, name="event_ndims")
@@ -1878,6 +2394,7 @@ class CholeskyOuterProduct(Bijector):
       raise ValueError("`event_ndims` must be a TF constant which is 0 or 2")
     self._static_event_ndims = event_ndims
     super(CholeskyOuterProduct, self).__init__(
+        event_ndims=event_ndims,
         validate_args=validate_args,
         name=name)
 
@@ -1900,7 +2417,7 @@ class CholeskyOuterProduct(Bijector):
 
   def _forward_log_det_jacobian(self, x):
     # Let Y be a symmetric, positive definite matrix and write:
-    #   Y = X X^T
+    #   Y = X X.T
     # where X is lower-triangular.
     #
     # Observe that,
@@ -1947,6 +2464,12 @@ class CholeskyOuterProduct(Bijector):
       return math.log(2.) + math_ops.log(x)
 
     diag = array_ops.matrix_diag_part(x)
+
+    # We now ensure diag is columnar. Eg, if `diag = [1, 2, 3]` then the output
+    # is `[[1], [2], [3]]` and if `diag = [[1, 2, 3], [4, 5, 6]]` then the
+    # output is unchanged.
+    diag = self._make_columnar(diag)
+
     if self.validate_args:
       is_matrix = check_ops.assert_rank_at_least(
           x, 2, message="Input must be a (batch of) matrix.")
@@ -1960,20 +2483,49 @@ class CholeskyOuterProduct(Bijector):
       x = control_flow_ops.with_dependencies(
           [is_matrix, is_square, is_positive_definite], x)
 
-    # Create a column vector equal to: [p, p-1, ..., 2, 1]^T.
+    # Create a vector equal to: [p, p-1, ..., 2, 1].
     if x.get_shape().ndims is None or x.get_shape()[-1].value is None:
-      p = array_ops.shape(x)[-1]
+      p_int = array_ops.shape(x)[-1]
+      p_float = math_ops.cast(p_int, dtype=x.dtype)
     else:
-      p = x.get_shape()[-1].value
-    exponents = array_ops.expand_dims(
-        math_ops.linspace(math_ops.cast(p, dtype=x.dtype), 1., p),
-        dim=1)
+      p_int = x.get_shape()[-1].value
+      p_float = np.array(p_int, dtype=x.dtype.as_numpy_dtype)
+    exponents = math_ops.linspace(p_float, 1., p_int)
 
     sum_weighted_log_diag = array_ops.squeeze(
-        math_ops.matmul(math_ops.log(diag), exponents), squeeze_dims=-1)
-    fldj = p * math.log(2.) + sum_weighted_log_diag
-
-    if x.get_shape().ndims is not None:
-      fldj.set_shape(x.get_shape()[:-2])
+        math_ops.matmul(math_ops.log(diag),
+                        exponents[..., array_ops.newaxis]),
+        squeeze_dims=-1)
+    fldj = p_float * math.log(2.) + sum_weighted_log_diag
 
     return fldj
+
+  def _make_columnar(self, x):
+    """Ensures non-scalar input has at least one column.
+
+    Example:
+      If `x = [1, 2, 3]` then the output is `[[1], [2], [3]]`.
+
+      If `x = [[1, 2, 3], [4, 5, 6]]` then the output is unchanged.
+
+      If `x = 1` then the output is unchanged.
+
+    Args:
+      x: `Tensor`.
+
+    Returns:
+      columnar_x: `Tensor` with at least two dimensions.
+    """
+    if x.get_shape().ndims is not None:
+      if x.get_shape().ndims == 1:
+        x = x[array_ops.newaxis, :]
+      return x
+    shape = array_ops.shape(x)
+    maybe_expanded_shape = array_ops.concat([
+        shape[:-1],
+        distribution_util.pick_vector(
+            math_ops.equal(array_ops.rank(x), 1),
+            [1], np.array([], dtype=np.int32)),
+        shape[-1:],
+    ], 0)
+    return array_ops.reshape(x, maybe_expanded_shape)

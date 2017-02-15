@@ -23,14 +23,11 @@ of values and number of dimensions in the `SparseTensor`, respectively:
   [2,4] of the tensor has a value of 3.6.
 
 * `dense_shape`: A 1-D int64 tensor of dense_shape `[ndims]`, which specifies
-the
-  dense_shape of the sparse tensor. Takes a list indicating the number of
-  elements
-  in each dimension. For example, `dense_shape=[3,6]` specifies a
-  two-dimensional
-  3x6 tensor, `dense_shape=[2,3,4]` specifies a three-dimensional 2x3x4
-  tensor, and
-  `dense_shape=[9]` specifies a one-dimensional tensor with 9 elements.
+  the dense_shape of the sparse tensor. Takes a list indicating the number of
+  elements in each dimension. For example, `dense_shape=[3,6]` specifies a
+  two-dimensional 3x6 tensor, `dense_shape=[2,3,4]` specifies a
+  three-dimensional 2x3x4 tensor, and `dense_shape=[9]` specifies a
+  one-dimensional tensor with 9 elements.
 
 The corresponding dense tensor satisfies:
 
@@ -58,96 +55,6 @@ represents the dense tensor
  [0, 0, 2, 0]
  [0, 0, 0, 0]]
 ```
-
-- - -
-
-#### `tf.SparseTensor.__init__(indices, values, dense_shape=None, shape=None)` {#SparseTensor.__init__}
-
-Creates a `SparseTensor`.
-
-##### Args:
-
-
-*  <b>`indices`</b>: A 2-D int64 tensor of dense_shape `[N, ndims]`.
-*  <b>`values`</b>: A 1-D tensor of any type and dense_shape `[N]`.
-*  <b>`dense_shape`</b>: A 1-D int64 tensor of dense_shape `[ndims]`.
-*  <b>`shape`</b>: Temporary.  Legacy naming of dense_shape.  Only one of `shape` or
-    `dense_shape` must be provided.
-
-##### Returns:
-
-  A `SparseTensor`.
-
-##### Raises:
-
-
-*  <b>`ValueError`</b>: if both `shape` and `dense_shape` are provided.
-
-
-- - -
-
-#### `tf.SparseTensor.get_shape()` {#SparseTensor.get_shape}
-
-Get the `TensorShape` representing the shape of the dense tensor.
-
-##### Returns:
-
-  A `TensorShape` object.
-
-
-- - -
-
-#### `tf.SparseTensor.indices` {#SparseTensor.indices}
-
-The indices of non-zero values in the represented dense tensor.
-
-##### Returns:
-
-  A 2-D Tensor of int64 with dense_shape `[N, ndims]`, where `N` is the
-    number of non-zero values in the tensor, and `ndims` is the rank.
-
-
-- - -
-
-#### `tf.SparseTensor.values` {#SparseTensor.values}
-
-The non-zero values in the represented dense tensor.
-
-##### Returns:
-
-  A 1-D Tensor of any data type.
-
-
-- - -
-
-#### `tf.SparseTensor.dense_shape` {#SparseTensor.dense_shape}
-
-A 1-D Tensor of int64 representing the shape of the dense tensor.
-
-
-- - -
-
-#### `tf.SparseTensor.dtype` {#SparseTensor.dtype}
-
-The `DType` of elements in this tensor.
-
-
-- - -
-
-#### `tf.SparseTensor.op` {#SparseTensor.op}
-
-The `Operation` that produces `values` as an output.
-
-
-- - -
-
-#### `tf.SparseTensor.graph` {#SparseTensor.graph}
-
-The `Graph` that contains the index, value, and dense_shape tensors.
-
-
-
-#### Other Methods
 - - -
 
 #### `tf.SparseTensor.__div__(sp_x, y)` {#SparseTensor.__div__}
@@ -175,6 +82,24 @@ the other direction.
 
   A `Tensor`. Has the same type as `sp_values`.
   1-D.  The `N` values that are operated on.
+
+
+- - -
+
+#### `tf.SparseTensor.__init__(indices, values, dense_shape)` {#SparseTensor.__init__}
+
+Creates a `SparseTensor`.
+
+##### Args:
+
+
+*  <b>`indices`</b>: A 2-D int64 tensor of shape `[N, ndims]`.
+*  <b>`values`</b>: A 1-D tensor of any type and shape `[N]`.
+*  <b>`dense_shape`</b>: A 1-D int64 tensor of shape `[ndims]`.
+
+##### Returns:
+
+  A `SparseTensor`.
 
 
 - - -
@@ -226,6 +151,20 @@ Internal helper function for 'sp_t / dense_t'.
 
 - - -
 
+#### `tf.SparseTensor.dense_shape` {#SparseTensor.dense_shape}
+
+A 1-D Tensor of int64 representing the shape of the dense tensor.
+
+
+- - -
+
+#### `tf.SparseTensor.dtype` {#SparseTensor.dtype}
+
+The `DType` of elements in this tensor.
+
+
+- - -
+
 #### `tf.SparseTensor.eval(feed_dict=None, session=None)` {#SparseTensor.eval}
 
 Evaluates this sparse tensor in a `Session`.
@@ -261,8 +200,49 @@ available, or `session` must be specified explicitly.
 
 - - -
 
-#### `tf.SparseTensor.shape` {#SparseTensor.shape}
+#### `tf.SparseTensor.get_shape()` {#SparseTensor.get_shape}
 
-Legacy property returning `dense_shape`.
+Get the `TensorShape` representing the shape of the dense tensor.
+
+##### Returns:
+
+  A `TensorShape` object.
+
+
+- - -
+
+#### `tf.SparseTensor.graph` {#SparseTensor.graph}
+
+The `Graph` that contains the index, value, and dense_shape tensors.
+
+
+- - -
+
+#### `tf.SparseTensor.indices` {#SparseTensor.indices}
+
+The indices of non-zero values in the represented dense tensor.
+
+##### Returns:
+
+  A 2-D Tensor of int64 with dense_shape `[N, ndims]`, where `N` is the
+    number of non-zero values in the tensor, and `ndims` is the rank.
+
+
+- - -
+
+#### `tf.SparseTensor.op` {#SparseTensor.op}
+
+The `Operation` that produces `values` as an output.
+
+
+- - -
+
+#### `tf.SparseTensor.values` {#SparseTensor.values}
+
+The non-zero values in the represented dense tensor.
+
+##### Returns:
+
+  A 1-D Tensor of any data type.
 
 

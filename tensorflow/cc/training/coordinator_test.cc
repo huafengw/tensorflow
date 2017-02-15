@@ -46,7 +46,7 @@ TEST(CoordinatorTest, TestStopAndWaitOnStop) {
   Env::Default()->SleepForMicroseconds(10000000);
   EXPECT_EQ(stopped, false);
 
-  coord.RequestStop();
+  TF_EXPECT_OK(coord.RequestStop());
   done.WaitForNotification();
   EXPECT_EQ(stopped, true);
   EXPECT_EQ(coord.ShouldStop(), true);
@@ -58,6 +58,7 @@ class MockQueueRunner : public RunnerInterface {
     coord_ = coord;
     join_counter_ = nullptr;
     thread_pool_.reset(new thread::ThreadPool(Env::Default(), "test-pool", 10));
+    stopped_ = false;
   }
 
   MockQueueRunner(Coordinator* coord, int* join_counter)
@@ -87,13 +88,17 @@ class MockQueueRunner : public RunnerInterface {
 
   void SetStatus(const Status& status) { status_ = status; }
 
+  bool IsRunning() const override { return !stopped_; };
+
+  void Stop() { stopped_ = true; }
+
  private:
   void CountThread(std::atomic<int>* counter, int until) {
     while (!coord_->ShouldStop() && counter->load() < until) {
       (*counter)++;
       Env::Default()->SleepForMicroseconds(100000);
     }
-    coord_->RequestStop();
+    coord_->RequestStop().IgnoreError();
   }
   void SetStatusThread(const Status& status, BlockingCounter* counter) {
     Env::Default()->SleepForMicroseconds(100000);
@@ -104,6 +109,7 @@ class MockQueueRunner : public RunnerInterface {
   Status status_;
   Coordinator* coord_;
   int* join_counter_;
+  bool stopped_;
 };
 
 TEST(CoordinatorTest, TestRealStop) {
@@ -112,16 +118,16 @@ TEST(CoordinatorTest, TestRealStop) {
 
   std::unique_ptr<MockQueueRunner> qr1(new MockQueueRunner(&coord));
   qr1->StartCounting(&counter, 100);
-  coord.RegisterRunner(std::move(qr1));
+  TF_ASSERT_OK(coord.RegisterRunner(std::move(qr1)));
 
   std::unique_ptr<MockQueueRunner> qr2(new MockQueueRunner(&coord));
   qr2->StartCounting(&counter, 100);
-  coord.RegisterRunner(std::move(qr2));
+  TF_ASSERT_OK(coord.RegisterRunner(std::move(qr2)));
 
   // Wait until the counting has started
   while (counter.load() == 0)
     ;
-  coord.RequestStop();
+  TF_EXPECT_OK(coord.RequestStop());
 
   int temp_counter = counter.load();
   Env::Default()->SleepForMicroseconds(10000000);
@@ -136,7 +142,7 @@ TEST(CoordinatorTest, TestRequestStop) {
   for (int i = 0; i < 10; i++) {
     qr.reset(new MockQueueRunner(&coord));
     qr->StartCounting(&counter, 10);
-    coord.RegisterRunner(std::move(qr));
+    TF_ASSERT_OK(coord.RegisterRunner(std::move(qr)));
   }
 
   coord.WaitForStop();
@@ -150,12 +156,12 @@ TEST(CoordinatorTest, TestJoin) {
   int join_counter = 0;
   std::unique_ptr<MockQueueRunner> qr1(
       new MockQueueRunner(&coord, &join_counter));
-  coord.RegisterRunner(std::move(qr1));
+  TF_ASSERT_OK(coord.RegisterRunner(std::move(qr1)));
   std::unique_ptr<MockQueueRunner> qr2(
       new MockQueueRunner(&coord, &join_counter));
-  coord.RegisterRunner(std::move(qr2));
+  TF_ASSERT_OK(coord.RegisterRunner(std::move(qr2)));
 
-  coord.RequestStop();
+  TF_EXPECT_OK(coord.RequestStop());
   TF_EXPECT_OK(coord.Join());
   EXPECT_EQ(join_counter, 2);
 }
@@ -166,27 +172,37 @@ TEST(CoordinatorTest, StatusReporting) {
 
   std::unique_ptr<MockQueueRunner> qr1(new MockQueueRunner(&coord));
   qr1->StartSettingStatus(Status(Code::CANCELLED, ""), &counter);
-  coord.RegisterRunner(std::move(qr1));
+  TF_ASSERT_OK(coord.RegisterRunner(std::move(qr1)));
 
   std::unique_ptr<MockQueueRunner> qr2(new MockQueueRunner(&coord));
   qr2->StartSettingStatus(Status(Code::INVALID_ARGUMENT, ""), &counter);
-  coord.RegisterRunner(std::move(qr2));
+  TF_ASSERT_OK(coord.RegisterRunner(std::move(qr2)));
 
   std::unique_ptr<MockQueueRunner> qr3(new MockQueueRunner(&coord));
   qr3->StartSettingStatus(Status(Code::OUT_OF_RANGE, ""), &counter);
-  coord.RegisterRunner(std::move(qr3));
+  TF_ASSERT_OK(coord.RegisterRunner(std::move(qr3)));
 
   counter.Wait();
-  coord.RequestStop();
+  TF_EXPECT_OK(coord.RequestStop());
   EXPECT_EQ(coord.Join().code(), Code::INVALID_ARGUMENT);
 }
 
 TEST(CoordinatorTest, JoinWithoutStop) {
   Coordinator coord;
   std::unique_ptr<MockQueueRunner> qr(new MockQueueRunner(&coord));
-  coord.RegisterRunner(std::move(qr));
+  TF_ASSERT_OK(coord.RegisterRunner(std::move(qr)));
 
   EXPECT_EQ(coord.Join().code(), Code::FAILED_PRECONDITION);
+}
+
+TEST(CoordinatorTest, AllRunnersStopped) {
+  Coordinator coord;
+  MockQueueRunner* qr = new MockQueueRunner(&coord);
+  TF_ASSERT_OK(coord.RegisterRunner(std::unique_ptr<RunnerInterface>(qr)));
+
+  EXPECT_FALSE(coord.AllRunnersStopped());
+  qr->Stop();
+  EXPECT_TRUE(coord.AllRunnersStopped());
 }
 
 }  // namespace
